@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -331,3 +332,149 @@ def test_backfill_entry_time_from_verified_ticket(tmp_path: Path):
             assert str(third).startswith("2026-11-09 01:00:00")
     finally:
         old_engine.dispose()
+
+
+ITEM_MERCHANTS = {
+    "门票": "青山景区票务",
+    "咖啡": "云顶咖啡",
+    "越野车": "极速越野",
+}
+
+
+def _make_order(
+    items: list[tuple[str, backend.VerifyStatus]],
+    *,
+    total_amount: Decimal = Decimal("200.00"),
+    lifecycle: str = "completed",
+) -> int:
+    now = backend._utcnow_naive()
+    if lifecycle == "completed":
+        entered_at, exited_at = now - timedelta(days=10), now - timedelta(days=9)
+    elif lifecycle == "not_started":
+        entered_at, exited_at = None, None
+    elif lifecycle == "active":
+        entered_at, exited_at = now, None
+    elif lifecycle == "post_leave":
+        entered_at, exited_at = now - timedelta(hours=2), now - timedelta(hours=1)
+    else:
+        raise ValueError(f"未知 lifecycle: {lifecycle}")
+
+    with backend.SessionLocal() as db:
+        merchants = {
+            merchant.name: merchant
+            for merchant in db.scalars(backend.select(backend.Merchant)).all()
+        }
+        order = backend.Order(
+            order_no=f"LIFE-{uuid.uuid4().hex[:12]}",
+            total_amount=total_amount,
+            status=backend.OrderStatus.PAID,
+            entered_at=entered_at,
+            exited_at=exited_at,
+        )
+        db.add(order)
+        db.flush()
+        for item_name, verify_status in items:
+            db.add(
+                backend.VerifyRecord(
+                    order_id=order.id,
+                    merchant_id=merchants[ITEM_MERCHANTS[item_name]].id,
+                    item_name=item_name,
+                    verify_status=verify_status,
+                )
+            )
+        db.commit()
+        return int(order.id)
+
+
+def _set_park_settings(
+    refund_after_lifecycle: bool,
+    refund_window_hours: int = 72,
+) -> None:
+    with backend.SessionLocal() as db:
+        settings = backend._load_park_settings(db)
+        settings.refund_after_lifecycle = refund_after_lifecycle
+        settings.refund_window_hours = refund_window_hours
+        db.commit()
+
+
+def _record_id(order_id: int, item_name: str) -> int:
+    with backend.SessionLocal() as db:
+        record = db.scalar(
+            backend.select(backend.VerifyRecord).where(
+                backend.VerifyRecord.order_id == order_id,
+                backend.VerifyRecord.item_name == item_name,
+            )
+        )
+        assert record is not None
+        return int(record.id)
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    fixed = datetime(2026, 11, 11, 4, 0, 0)
+    monkeypatch.setattr(backend, "_utcnow_naive", lambda: fixed)
+    return fixed
+
+
+def test_ticket_verify_starts_lifecycle(client, frozen_now):
+    order_id = _make_order(
+        [
+            ("门票", backend.VerifyStatus.UNVERIFIED),
+            ("咖啡", backend.VerifyStatus.UNVERIFIED),
+        ],
+        total_amount=Decimal("120.00"),
+        lifecycle="not_started",
+    )
+    ticket_id = _record_id(order_id, "门票")
+
+    verify = client.post(
+        f"/api/verify-records/{ticket_id}/verify", params={"post": "gate"}
+    )
+    assert verify.status_code == 200, verify.text
+
+    with backend.SessionLocal() as db:
+        order = db.get(backend.Order, order_id)
+        assert order.entered_at == frozen_now
+        snapshot = backend._order_lifecycle(
+            order, backend._load_park_settings(db), now=frozen_now
+        )
+        assert snapshot.status == backend.LifecycleStatus.ACTIVE
+        assert snapshot.can_verify is True
+        assert snapshot.can_split is False
+
+
+def test_ticket_verify_blocked_after_closing(client, monkeypatch):
+    monkeypatch.setattr(
+        backend, "_utcnow_naive", lambda: datetime(2026, 11, 11, 11, 0, 0)
+    )
+    order_id = _make_order(
+        [("门票", backend.VerifyStatus.UNVERIFIED)],
+        total_amount=Decimal("80.00"),
+        lifecycle="not_started",
+    )
+    ticket_id = _record_id(order_id, "门票")
+
+    verify = client.post(
+        f"/api/verify-records/{ticket_id}/verify", params={"post": "gate"}
+    )
+    assert verify.status_code == 409, verify.text
+    assert "闭园" in verify.json()["detail"]
+
+
+def test_verify_blocked_after_visit_ends(client, frozen_now):
+    _set_park_settings(False, 72)
+    order_id = _make_order(
+        [
+            ("门票", backend.VerifyStatus.VERIFIED),
+            ("咖啡", backend.VerifyStatus.UNVERIFIED),
+        ],
+        total_amount=Decimal("120.00"),
+        lifecycle="completed",
+    )
+    coffee_id = _record_id(order_id, "咖啡")
+
+    verify = client.post(
+        f"/api/verify-records/{coffee_id}/verify", params={"post": "coffee"}
+    )
+    assert verify.status_code == 409, verify.text
+    assert "重新购票" in verify.json()["detail"]

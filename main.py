@@ -1277,6 +1277,33 @@ def _to_park_settings_out(settings: ParkSettings) -> ParkSettingsOut:
     )
 
 
+def _order_lifecycle(
+    order: Order,
+    settings: ParkSettings,
+    *,
+    now: datetime | None = None,
+) -> LifecycleSnapshot:
+    records = list(order.verify_records)
+    return evaluate_lifecycle(
+        entered_at=order.entered_at,
+        exited_at=order.exited_at,
+        has_ticket=any("门票" in record.item_name for record in records),
+        has_pending_items=any(
+            record.verify_status == VerifyStatus.UNVERIFIED
+            for record in records
+        ),
+        refund_after_lifecycle=bool(settings.refund_after_lifecycle),
+        refund_window_hours=int(settings.refund_window_hours),
+        now=now,
+    )
+
+
+def _verify_blocked_message(snapshot: LifecycleSnapshot) -> str:
+    if snapshot.status == LifecycleStatus.NOT_STARTED:
+        return snapshot.message
+    return "本次游园已结束，如需再次入园请重新购票。"
+
+
 # 岗位 -> 该岗位负责核销的项目关键字（与现场业务口径保持一致）。
 VERIFY_POST_ITEM_KEYWORDS: dict[VerifyPost, str] = {
     VerifyPost.GATE: "门票",
@@ -2746,7 +2773,31 @@ def verify_record(
         # 新逻辑：二维码只提供“这是哪张订单”，由岗位决定核销哪个子项。
         record = _select_record_for_post(order, post)
 
+    target_is_ticket = "门票" in record.item_name
+    if not target_is_ticket:
+        ticket_records = [
+            item for item in order.verify_records if "门票" in item.item_name
+        ]
+        if ticket_records and not any(
+            item.verify_status == VerifyStatus.VERIFIED
+            for item in ticket_records
+        ):
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail="门票未核销，请先去检票口",
+            )
+
+    settings = _load_park_settings(db)
+    lifecycle = _order_lifecycle(order, settings)
+    if not lifecycle.can_verify:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=_verify_blocked_message(lifecycle),
+        )
+
     record.verify_status = VerifyStatus.VERIFIED
+    if target_is_ticket and order.entered_at is None:
+        order.entered_at = _utcnow_naive()
     db.commit()
     db.refresh(record)
     logger.info(
