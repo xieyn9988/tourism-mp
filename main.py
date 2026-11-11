@@ -251,7 +251,6 @@ PARK_TZ = timezone(timedelta(hours=8))
 DEFAULT_OPEN_TIME = "08:00"
 DEFAULT_CLOSE_TIME = "23:59:59"
 DEFAULT_CLOSE_TIME_VALUE = dt_time(23, 59, 59)
-DEFAULT_PARK_CLOSE_TIME = "18:00"
 
 
 def _parse_clock_time(raw: str | None) -> dt_time | None:
@@ -270,21 +269,6 @@ def _parse_clock_time(raw: str | None) -> dt_time | None:
         return None
 
 
-def _parse_park_close_time(raw: str) -> dt_time:
-    try:
-        hour_text, minute_text = raw.strip().split(":", 1)
-        parsed = dt_time(int(hour_text), int(minute_text))
-    except (AttributeError, TypeError, ValueError):
-        logger.warning("PARK_CLOSE_TIME 格式无效：%r，回退到 %s", raw, DEFAULT_PARK_CLOSE_TIME)
-        return dt_time(18, 0)
-    return parsed
-
-
-PARK_CLOSE_TIME = _parse_park_close_time(
-    os.getenv("PARK_CLOSE_TIME", DEFAULT_PARK_CLOSE_TIME)
-)
-
-
 def _utcnow_naive() -> datetime:
     """当前 UTC 时间，去掉 tzinfo，与 SQLite 中存储的 naive UTC 一致。"""
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -300,13 +284,13 @@ def _to_park_local(value: datetime) -> datetime:
     return _as_utc_naive(value).replace(tzinfo=timezone.utc).astimezone(PARK_TZ)
 
 
-def _today_closing_at(now: datetime) -> datetime:
+def _today_closing_at(now: datetime, close_time: dt_time) -> datetime:
     """返回 now 所在北京日期的闭园时刻，转成 naive UTC。"""
     local = _to_park_local(now)
     closing_local = local.replace(
-        hour=PARK_CLOSE_TIME.hour,
-        minute=PARK_CLOSE_TIME.minute,
-        second=0,
+        hour=close_time.hour,
+        minute=close_time.minute,
+        second=close_time.second,
         microsecond=0,
     )
     return closing_local.astimezone(timezone.utc).replace(tzinfo=None)
@@ -327,12 +311,15 @@ def evaluate_lifecycle(
     refund_after_lifecycle: bool,
     refund_window_hours: int,
     now: datetime | None = None,
+    close_time: dt_time | None = None,
 ) -> LifecycleSnapshot:
     """根据订单字段、子项状态、园区配置与当前时间计算生命周期快照。
 
     leave_at = min(exited_at, 入园当天的闭园时刻)，全部使用 naive UTC 比较。
+    close_time 来自订单门票商户，缺失时回退 23:59:59。
     """
     now_value = _utcnow_naive() if now is None else _as_utc_naive(now)
+    closing_time = close_time or DEFAULT_CLOSE_TIME_VALUE
 
     if not has_ticket:
         return LifecycleSnapshot(
@@ -349,7 +336,7 @@ def evaluate_lifecycle(
         )
 
     if entered_at is None:
-        today_closing = _today_closing_at(now_value)
+        today_closing = _today_closing_at(now_value, closing_time)
         if now_value < today_closing:
             return LifecycleSnapshot(
                 status=LifecycleStatus.NOT_STARTED,
@@ -381,7 +368,7 @@ def evaluate_lifecycle(
 
     entered_value = _as_utc_naive(entered_at)
     exited_value = None if exited_at is None else _as_utc_naive(exited_at)
-    closing_at = _today_closing_at(entered_value)
+    closing_at = _today_closing_at(entered_value, closing_time)
     leave_at = closing_at if exited_value is None else min(exited_value, closing_at)
 
     if not has_pending_items:
@@ -1349,11 +1336,23 @@ def _to_park_settings_out(settings: ParkSettings) -> ParkSettingsOut:
     )
 
 
+def _resolve_order_close_time(db: Session, order: Order) -> dt_time:
+    """整单闭园时间取订单门票所属商户；缺失/非法时回退默认 23:59:59。"""
+    ticket = next(
+        (record for record in order.verify_records if "门票" in record.item_name),
+        None,
+    )
+    merchant = db.get(Merchant, ticket.merchant_id) if ticket is not None else None
+    parsed = _parse_clock_time(merchant.close_time) if merchant is not None else None
+    return parsed or DEFAULT_CLOSE_TIME_VALUE
+
+
 def _order_lifecycle(
     order: Order,
     settings: ParkSettings,
     *,
     now: datetime | None = None,
+    close_time: dt_time | None = None,
 ) -> LifecycleSnapshot:
     records = list(order.verify_records)
     return evaluate_lifecycle(
@@ -1367,6 +1366,7 @@ def _order_lifecycle(
         refund_after_lifecycle=bool(settings.refund_after_lifecycle),
         refund_window_hours=int(settings.refund_window_hours),
         now=now,
+        close_time=close_time,
     )
 
 
@@ -2883,6 +2883,19 @@ def verify_record(
             detail=f"订单状态为 {order.status.value}，不允许核销",
         )
 
+    now_value = _utcnow_naive()
+    closing_at = _today_closing_at(
+        now_value, _resolve_order_close_time(db, order)
+    )
+    if now_value >= closing_at:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=(
+                f"景区已闭园（{_format_park_time(closing_at)}），"
+                "今日无法核销，请明日再来。"
+            ),
+        )
+
     if post is None:
         # 兼容旧调用：record_id 就是本次要核销的那一条记录。
         record = seed
@@ -2915,7 +2928,11 @@ def verify_record(
             )
 
     settings = _load_park_settings(db)
-    lifecycle = _order_lifecycle(order, settings)
+    lifecycle = _order_lifecycle(
+        order,
+        settings,
+        close_time=_resolve_order_close_time(db, order),
+    )
     if not lifecycle.can_verify:
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
@@ -2947,7 +2964,11 @@ def verify_record(
 def get_order_lifecycle(order_id: int, db: DbSession) -> LifecycleOut:
     order = _load_order_with_records(db, order_id)
     settings = _load_park_settings(db)
-    snapshot = _order_lifecycle(order, settings)
+    snapshot = _order_lifecycle(
+        order,
+        settings,
+        close_time=_resolve_order_close_time(db, order),
+    )
     return _to_lifecycle_out(order, settings, snapshot)
 
 
@@ -2978,7 +2999,11 @@ def register_exit(record_id: int, db: DbSession) -> LifecycleOut:
         db.commit()
         logger.info("离园登记：order_id=%s, exited_at=%s", order.id, order.exited_at)
 
-    snapshot = _order_lifecycle(order, settings)
+    snapshot = _order_lifecycle(
+        order,
+        settings,
+        close_time=_resolve_order_close_time(db, order),
+    )
     return _to_lifecycle_out(order, settings, snapshot)
 
 
@@ -3035,7 +3060,11 @@ def split_order(
         )
 
     settings = _load_park_settings(db)
-    lifecycle = _order_lifecycle(order, settings)
+    lifecycle = _order_lifecycle(
+        order,
+        settings,
+        close_time=_resolve_order_close_time(db, order),
+    )
     if not lifecycle.can_split:
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
@@ -3292,7 +3321,11 @@ def refund_order(
         )
 
     settings = _load_park_settings(db)
-    lifecycle = _order_lifecycle(order, settings)
+    lifecycle = _order_lifecycle(
+        order,
+        settings,
+        close_time=_resolve_order_close_time(db, order),
+    )
     if not lifecycle.can_refund:
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,

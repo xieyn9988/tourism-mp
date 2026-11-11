@@ -38,6 +38,7 @@ def _eval(**overrides):
         refund_after_lifecycle=False,
         refund_window_hours=72,
         now=NOW,
+        close_time=dt_time(18, 0),
     )
     params.update(overrides)
     return backend.evaluate_lifecycle(**params)
@@ -409,6 +410,19 @@ def _record_id(order_id: int, item_name: str) -> int:
         return int(record.id)
 
 
+def _set_ticket_merchant_close_time(value: str) -> str:
+    with backend.SessionLocal() as db:
+        merchant = db.scalar(
+            backend.select(backend.Merchant).where(
+                backend.Merchant.name == "青山景区票务"
+            )
+        )
+        previous = merchant.close_time
+        merchant.close_time = value
+        db.commit()
+        return previous
+
+
 @pytest.fixture
 def frozen_now(monkeypatch):
     fixed = datetime(2026, 11, 11, 4, 0, 0)
@@ -444,21 +458,25 @@ def test_ticket_verify_starts_lifecycle(client, frozen_now):
 
 
 def test_ticket_verify_blocked_after_closing(client, monkeypatch):
-    monkeypatch.setattr(
-        backend, "_utcnow_naive", lambda: datetime(2026, 11, 11, 11, 0, 0)
-    )
-    order_id = _make_order(
-        [("门票", backend.VerifyStatus.UNVERIFIED)],
-        total_amount=Decimal("80.00"),
-        lifecycle="not_started",
-    )
-    ticket_id = _record_id(order_id, "门票")
+    previous = _set_ticket_merchant_close_time("18:00")
+    try:
+        monkeypatch.setattr(
+            backend, "_utcnow_naive", lambda: datetime(2026, 11, 11, 11, 0, 0)
+        )
+        order_id = _make_order(
+            [("门票", backend.VerifyStatus.UNVERIFIED)],
+            total_amount=Decimal("80.00"),
+            lifecycle="not_started",
+        )
+        ticket_id = _record_id(order_id, "门票")
 
-    verify = client.post(
-        f"/api/verify-records/{ticket_id}/verify", params={"post": "gate"}
-    )
-    assert verify.status_code == 409, verify.text
-    assert "闭园" in verify.json()["detail"]
+        verify = client.post(
+            f"/api/verify-records/{ticket_id}/verify", params={"post": "gate"}
+        )
+        assert verify.status_code == 409, verify.text
+        assert "闭园" in verify.json()["detail"]
+    finally:
+        _set_ticket_merchant_close_time(previous)
 
 
 def test_verify_blocked_after_visit_ends(client, frozen_now):
@@ -610,3 +628,93 @@ def test_seeded_merchants_have_default_business_hours(client):
     for merchant in merchants:
         assert merchant.open_time == "08:00"
         assert merchant.close_time == "23:59:59"
+
+
+def test_verify_allowed_before_merchant_close_time(client, monkeypatch):
+    previous = _set_ticket_merchant_close_time("23:59:59")
+    try:
+        monkeypatch.setattr(
+            backend, "_utcnow_naive", lambda: datetime(2026, 11, 11, 11, 0, 0)
+        )  # 北京 19:00，商户配置到 23:59:59，仍可核销（旧代码 18:00 会拦截）
+        order_id = _make_order(
+            [("门票", backend.VerifyStatus.UNVERIFIED)],
+            total_amount=Decimal("80.00"),
+            lifecycle="not_started",
+        )
+        ticket_id = _record_id(order_id, "门票")
+        verify = client.post(
+            f"/api/verify-records/{ticket_id}/verify", params={"post": "gate"}
+        )
+        assert verify.status_code == 200, verify.text
+    finally:
+        _set_ticket_merchant_close_time(previous)
+
+
+def test_verify_blocked_after_merchant_close_time(client, monkeypatch):
+    previous = _set_ticket_merchant_close_time("12:00")
+    try:
+        monkeypatch.setattr(
+            backend, "_utcnow_naive", lambda: datetime(2026, 11, 11, 4, 0, 1)
+        )  # 北京 12:00:01，已过 12:00
+        order_id = _make_order(
+            [("门票", backend.VerifyStatus.UNVERIFIED)],
+            total_amount=Decimal("80.00"),
+            lifecycle="not_started",
+        )
+        ticket_id = _record_id(order_id, "门票")
+        verify = client.post(
+            f"/api/verify-records/{ticket_id}/verify", params={"post": "gate"}
+        )
+        assert verify.status_code == 409, verify.text
+        assert "闭园" in verify.json()["detail"]
+    finally:
+        _set_ticket_merchant_close_time(previous)
+
+
+def test_invalid_merchant_close_time_falls_back_to_default(client, monkeypatch):
+    previous = _set_ticket_merchant_close_time("not-a-time")
+    try:
+        monkeypatch.setattr(
+            backend, "_utcnow_naive", lambda: datetime(2026, 11, 11, 11, 0, 0)
+        )  # 北京 19:00，非法配置回退 23:59:59，仍可核销
+        order_id = _make_order(
+            [("门票", backend.VerifyStatus.UNVERIFIED)],
+            total_amount=Decimal("80.00"),
+            lifecycle="not_started",
+        )
+        ticket_id = _record_id(order_id, "门票")
+        verify = client.post(
+            f"/api/verify-records/{ticket_id}/verify", params={"post": "gate"}
+        )
+        assert verify.status_code == 200, verify.text
+    finally:
+        _set_ticket_merchant_close_time(previous)
+
+
+def test_close_time_falls_back_without_ticket_record(client, monkeypatch):
+    monkeypatch.setattr(
+        backend, "_utcnow_naive", lambda: datetime(2026, 11, 11, 11, 0, 0)
+    )  # 北京 19:00，无门票记录 -> 回退默认 23:59:59
+    order_id = _make_order(
+        [("咖啡", backend.VerifyStatus.UNVERIFIED)],
+        total_amount=Decimal("40.00"),
+        lifecycle="not_started",
+    )
+    coffee_id = _record_id(order_id, "咖啡")
+    verify = client.post(
+        f"/api/verify-records/{coffee_id}/verify", params={"post": "coffee"}
+    )
+    assert verify.status_code == 200, verify.text
+
+    with backend.SessionLocal() as db:
+        order = backend._load_order_with_records(db, order_id)
+        assert backend._resolve_order_close_time(db, order) == dt_time(23, 59, 59)
+
+
+def test_default_close_time_keeps_seconds_and_utc_offset():
+    snapshot = _eval(
+        entered_at=datetime(2026, 11, 11, 2, 0, 0),
+        close_time=None,
+    )
+    # 北京 23:59:59 -> UTC 15:59:59，秒不能被截断。
+    assert snapshot.leave_at == datetime(2026, 11, 11, 15, 59, 59)
