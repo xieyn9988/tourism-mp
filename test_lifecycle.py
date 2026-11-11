@@ -226,3 +226,108 @@ def test_park_settings_update_requires_signature_and_validates(client: TestClien
         json_body={"refund_after_lifecycle": False, "refund_window_hours": 72},
     )
     assert reset.status_code == 200, reset.text
+
+
+OLD_ORDERS_DDL = """
+CREATE TABLE orders (
+    id INTEGER NOT NULL,
+    order_no VARCHAR(32) NOT NULL,
+    total_amount NUMERIC(10, 2) NOT NULL,
+    status VARCHAR(16) DEFAULT 'paid' NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    PRIMARY KEY (id)
+);
+"""
+
+
+def test_order_lifecycle_columns_migration(tmp_path: Path):
+    db_path = tmp_path / "old_lifecycle.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        OLD_ORDERS_DDL
+        + """
+        INSERT INTO orders (id, order_no, total_amount, status)
+            VALUES (1, 'OLD-LIFE-1', 100, 'paid');
+        """
+    )
+    conn.close()
+
+    old_engine = backend.create_engine(f"sqlite:///{db_path.as_posix()}")
+    try:
+        backend._migrate_order_lifecycle_columns(old_engine)
+
+        with old_engine.begin() as db_conn:
+            columns = {
+                row[1]
+                for row in db_conn.exec_driver_sql("PRAGMA table_info(orders)")
+            }
+            assert {"entered_at", "exited_at"} <= columns
+            assert (
+                db_conn.exec_driver_sql(
+                    "SELECT order_no FROM orders WHERE id = 1"
+                ).scalar()
+                == "OLD-LIFE-1"
+            )
+
+        backend._migrate_order_lifecycle_columns(old_engine)
+        with old_engine.begin() as db_conn:
+            versions = {
+                row[0]
+                for row in db_conn.exec_driver_sql(
+                    "SELECT version FROM schema_migrations"
+                )
+            }
+            assert backend.ORDER_LIFECYCLE_COLUMNS_MIGRATION in versions
+    finally:
+        old_engine.dispose()
+
+
+def test_backfill_entry_time_from_verified_ticket(tmp_path: Path):
+    db_path = tmp_path / "backfill_lifecycle.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        OLD_ORDERS_DDL
+        + """
+        ALTER TABLE orders ADD COLUMN entered_at DATETIME;
+        ALTER TABLE orders ADD COLUMN exited_at DATETIME;
+        CREATE TABLE verify_records (
+            id INTEGER NOT NULL PRIMARY KEY,
+            order_id INTEGER NOT NULL,
+            item_name VARCHAR(120) NOT NULL,
+            verify_status VARCHAR(16) NOT NULL,
+            updated_at DATETIME NOT NULL
+        );
+        INSERT INTO orders (id, order_no, total_amount, status)
+            VALUES (1, 'OLD-LIFE-1', 100, 'paid'),
+                   (2, 'OLD-LIFE-2', 100, 'paid'),
+                   (3, 'OLD-LIFE-3', 100, 'paid');
+        INSERT INTO verify_records
+            (id, order_id, item_name, verify_status, updated_at)
+            VALUES (1, 1, '门票', 'verified', '2026-11-10 02:00:00'),
+                   (2, 2, '咖啡', 'verified', '2026-11-10 03:00:00'),
+                   (3, 3, '门票', 'verified', '2026-11-10 04:00:00');
+        UPDATE orders SET entered_at = '2026-11-09 01:00:00' WHERE id = 3;
+        """
+    )
+    conn.close()
+
+    old_engine = backend.create_engine(f"sqlite:///{db_path.as_posix()}")
+    try:
+        backend._backfill_order_entry_times(old_engine)
+
+        with old_engine.begin() as db_conn:
+            first = db_conn.exec_driver_sql(
+                "SELECT entered_at FROM orders WHERE id = 1"
+            ).scalar()
+            second = db_conn.exec_driver_sql(
+                "SELECT entered_at FROM orders WHERE id = 2"
+            ).scalar()
+            third = db_conn.exec_driver_sql(
+                "SELECT entered_at FROM orders WHERE id = 3"
+            ).scalar()
+            assert str(first).startswith("2026-11-10 02:00:00")
+            assert second is None
+            assert str(third).startswith("2026-11-09 01:00:00")
+    finally:
+        old_engine.dispose()

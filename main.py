@@ -667,6 +667,12 @@ class Order(TimestampMixin, Base):
         index=True,
         comment="订单状态：unpaid/paid/split/refunded",
     )
+    entered_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="首次门票核销（入园）时间，naive UTC"
+    )
+    exited_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="出口扫码离园时间，naive UTC；为空表示未扫码离园"
+    )
 
     # 一对多：一笔订单包含多条核销项；删除订单时级联删除核销记录。
     verify_records: Mapped[list["VerifyRecord"]] = relationship(
@@ -901,6 +907,8 @@ class OrderOut(BaseModel):
     total_amount: float
     status: OrderStatus
     created_at: datetime
+    entered_at: datetime | None = None
+    exited_at: datetime | None = None
     verify_records: list[VerifyRecordOut] = Field(default_factory=list)
 
 
@@ -2383,6 +2391,66 @@ def _migrate_split_amount_column(bind: Engine) -> None:
         _record_migration(conn, SPLIT_AMOUNT_COLUMN_MIGRATION)
 
 
+ORDER_LIFECYCLE_COLUMNS_MIGRATION = "20261111_04_orders_lifecycle_columns"
+
+
+def _migrate_order_lifecycle_columns(bind: Engine) -> None:
+    """为旧库 orders 表补充 entered_at / exited_at（SQLite ALTER TABLE）。"""
+    if bind.dialect.name != "sqlite":
+        return
+    with bind.begin() as conn:
+        _ensure_schema_migrations_table(conn)
+        has_orders = conn.exec_driver_sql(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='orders'"
+        ).first()
+        if has_orders is None:
+            return
+        columns = {
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(orders)")
+        }
+        if "entered_at" not in columns:
+            conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN entered_at DATETIME")
+        if "exited_at" not in columns:
+            conn.exec_driver_sql("ALTER TABLE orders ADD COLUMN exited_at DATETIME")
+        _record_migration(conn, ORDER_LIFECYCLE_COLUMNS_MIGRATION)
+        logger.info("orders 表已补充生命周期字段 entered_at / exited_at")
+
+
+def _backfill_order_entry_times(bind: Engine) -> None:
+    """历史订单若已核销门票但缺少 entered_at，用最早一次门票核销时间回填。"""
+    if bind.dialect.name != "sqlite":
+        return
+    with bind.begin() as conn:
+        has_orders = conn.exec_driver_sql(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='orders'"
+        ).first()
+        has_records = conn.exec_driver_sql(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='verify_records'"
+        ).first()
+        if has_orders is None or has_records is None:
+            return
+        result = conn.exec_driver_sql(
+            """
+            UPDATE orders
+            SET entered_at = (
+                SELECT MIN(v.updated_at) FROM verify_records v
+                WHERE v.order_id = orders.id
+                  AND v.verify_status = 'verified'
+                  AND v.item_name LIKE '%门票%'
+            )
+            WHERE entered_at IS NULL
+              AND EXISTS (
+                SELECT 1 FROM verify_records v
+                WHERE v.order_id = orders.id
+                  AND v.verify_status = 'verified'
+                  AND v.item_name LIKE '%门票%'
+              )
+            """
+        )
+        if result.rowcount and result.rowcount > 0:
+            logger.info("已回填 %s 笔历史订单的入园时间", result.rowcount)
+
+
 def _backfill_split_order_status(bind: Engine) -> None:
     """把已有分账流水、但仍为 paid 的历史订单回填为 split。"""
     if bind.dialect.name != "sqlite":
@@ -2412,8 +2480,10 @@ def initialize_database() -> None:
     _migrate_order_status_split(engine)
     _migrate_verify_status_refunded(engine)
     _migrate_split_amount_column(engine)
+    _migrate_order_lifecycle_columns(engine)
     Base.metadata.create_all(bind=engine)
     _backfill_split_order_status(engine)
+    _backfill_order_entry_times(engine)
     with SessionLocal() as db:
         seed_data(db)
 
