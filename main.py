@@ -533,6 +533,33 @@ class LifecycleSnapshot:
 # 三、ORM 模型（业务表 + 分账流水 / 项目快照）
 # ===========================================================================
 
+PARK_SETTINGS_ID = 1
+DEFAULT_REFUND_WINDOW_HOURS = 72
+
+
+class ParkSettings(TimestampMixin, Base):
+    """园区级运营配置（单行，id 固定为 1）。"""
+
+    __tablename__ = "park_settings"
+    __table_args__ = (
+        CheckConstraint(
+            "refund_window_hours >= 0 AND refund_window_hours <= 8760",
+            name="ck_park_settings_refund_window_range",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    refund_after_lifecycle: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0",
+        comment="离园/闭园后是否仍允许未核销子项退款",
+    )
+    refund_window_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=DEFAULT_REFUND_WINDOW_HOURS,
+        server_default=str(DEFAULT_REFUND_WINDOW_HOURS),
+        comment="离园后退款窗口小时数",
+    )
+
+
 class Merchant(TimestampMixin, Base):
     """商户表。split_rate = 0.1 表示平台抽成 10%。"""
 
@@ -877,6 +904,16 @@ class OrderOut(BaseModel):
     verify_records: list[VerifyRecordOut] = Field(default_factory=list)
 
 
+class ParkSettingsOut(BaseModel):
+    refund_after_lifecycle: bool
+    refund_window_hours: int
+
+
+class ParkSettingsUpdate(BaseModel):
+    refund_after_lifecycle: bool
+    refund_window_hours: int = Field(ge=0, le=8760)
+
+
 # ===========================================================================
 # 五、接口签名验证（HMAC-SHA256）
 # ===========================================================================
@@ -1206,6 +1243,30 @@ def _load_order_with_records(db: Session, order_id: int) -> Order:
             detail="订单不存在",
         )
     return order
+
+
+def _load_park_settings(db: Session) -> ParkSettings:
+    settings = db.get(ParkSettings, PARK_SETTINGS_ID)
+    if settings is not None:
+        return settings
+
+    settings = ParkSettings(id=PARK_SETTINGS_ID)
+    db.add(settings)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        settings = db.get(ParkSettings, PARK_SETTINGS_ID)
+        if settings is None:
+            raise
+    return settings
+
+
+def _to_park_settings_out(settings: ParkSettings) -> ParkSettingsOut:
+    return ParkSettingsOut(
+        refund_after_lifecycle=bool(settings.refund_after_lifecycle),
+        refund_window_hours=int(settings.refund_window_hours),
+    )
 
 
 # 岗位 -> 该岗位负责核销的项目关键字（与现场业务口径保持一致）。
@@ -1946,6 +2007,8 @@ def seed_data(db: Session) -> None:
         logger.info("初始化演示订单：%s", DEMO_ORDER_NO)
 
     _upgrade_demo_order(db, order, item_merchants)
+    if db.get(ParkSettings, PARK_SETTINGS_ID) is None:
+        db.add(ParkSettings(id=PARK_SETTINGS_ID))
     db.commit()
 
 
@@ -2415,6 +2478,40 @@ def health(db: DbSession) -> dict:
         "database": "sqlite",
         "time": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.get(
+    "/api/park-settings",
+    response_model=ParkSettingsOut,
+    tags=["园区配置"],
+    summary="读取园区退款配置",
+)
+def get_park_settings(db: DbSession) -> ParkSettingsOut:
+    return _to_park_settings_out(_load_park_settings(db))
+
+
+@app.put(
+    "/api/park-settings",
+    response_model=ParkSettingsOut,
+    tags=["园区配置"],
+    summary="更新园区退款配置（需 HMAC 签名）",
+)
+def update_park_settings(
+    payload: ParkSettingsUpdate,
+    db: DbSession,
+    _: RequireSignature,
+) -> ParkSettingsOut:
+    settings = _load_park_settings(db)
+    settings.refund_after_lifecycle = payload.refund_after_lifecycle
+    settings.refund_window_hours = payload.refund_window_hours
+    db.commit()
+    db.refresh(settings)
+    logger.info(
+        "园区配置已更新：refund_after_lifecycle=%s, refund_window_hours=%s",
+        settings.refund_after_lifecycle,
+        settings.refund_window_hours,
+    )
+    return _to_park_settings_out(settings)
 
 
 @app.post(

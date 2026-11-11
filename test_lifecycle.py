@@ -22,6 +22,12 @@ TEST_DB = Path(os.environ["DATABASE_URL"].removeprefix("sqlite:///"))
 NOW = datetime(2026, 11, 11, 4, 0, 0)  # 北京时间 12:00，未闭园
 
 
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(backend.app) as test_client:
+        yield test_client
+
+
 def _eval(**overrides):
     params = dict(
         entered_at=None,
@@ -162,3 +168,61 @@ def test_early_exit_completes_when_post_leave_refund_disabled():
     assert snapshot.status == backend.LifecycleStatus.COMPLETED
     assert snapshot.reason == backend.LifecycleReason.POST_LEAVE_REFUND_DISABLED
     assert snapshot.can_split is True
+
+
+def _signed_request(client: TestClient, method: str, path: str, *, json_body=None):
+    body = b""
+    if json_body is not None:
+        body = json.dumps(
+            json_body, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    headers = backend.build_signature_headers(method, path, body=body)
+    if json_body is not None:
+        headers["Content-Type"] = "application/json"
+    return client.request(method, path, headers=headers, content=body)
+
+
+def test_park_settings_update_requires_signature_and_validates(client: TestClient):
+    path = "/api/park-settings"
+
+    unsigned = client.put(
+        path,
+        json={"refund_after_lifecycle": True, "refund_window_hours": 24},
+    )
+    assert unsigned.status_code == 403, unsigned.text
+
+    signed = _signed_request(
+        client,
+        "PUT",
+        path,
+        json_body={"refund_after_lifecycle": True, "refund_window_hours": 24},
+    )
+    assert signed.status_code == 200, signed.text
+    assert signed.json() == {
+        "refund_after_lifecycle": True,
+        "refund_window_hours": 24,
+    }
+    assert client.get(path).json() == {
+        "refund_after_lifecycle": True,
+        "refund_window_hours": 24,
+    }
+
+    for bad_hours in (-1, 8761):
+        invalid = _signed_request(
+            client,
+            "PUT",
+            path,
+            json_body={
+                "refund_after_lifecycle": True,
+                "refund_window_hours": bad_hours,
+            },
+        )
+        assert invalid.status_code == 422, invalid.text
+
+    reset = _signed_request(
+        client,
+        "PUT",
+        path,
+        json_body={"refund_after_lifecycle": False, "refund_window_hours": 72},
+    )
+    assert reset.status_code == 200, reset.text
