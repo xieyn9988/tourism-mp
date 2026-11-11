@@ -45,7 +45,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -93,6 +93,12 @@ VERIFY_POSTS: dict[str, dict[str, str]] = {
     "景区检票员": {"key": "gate", "item": "门票", "icon": "🎫"},
     "咖啡店员": {"key": "coffee", "item": "咖啡", "icon": "☕"},
     "越野车安全员": {"key": "offroad", "item": "越野车", "icon": "🚙"},
+}
+EXIT_POST_LABEL = "景区出口"
+EXIT_POST_CONFIG = {"key": "exit", "item": "离园", "icon": "🚪"}
+SCAN_POSTS: dict[str, dict[str, str]] = {
+    **VERIFY_POSTS,
+    EXIT_POST_LABEL: EXIT_POST_CONFIG,
 }
 DEFAULT_VERIFY_POST = "景区检票员"
 
@@ -162,15 +168,26 @@ def _build_signature_headers(
     return {"X-Timestamp": ts, "X-Signature": signature}
 
 
-def _post_signed(path: str) -> requests.Response:
-    """携带签名请求头调用后端资金接口（分账 / 退款）。"""
-    headers = _build_signature_headers("POST", path)
-    logger.info("调用签名接口：POST %s", path)
-    return requests.post(
+def _signed_request(
+    method: str,
+    path: str,
+    body: bytes = b"",
+) -> requests.Response:
+    headers = _build_signature_headers(method, path, body)
+    if body:
+        headers["Content-Type"] = "application/json"
+    logger.info("调用签名接口：%s %s", method.upper(), path)
+    return requests.request(
+        method.upper(),
         f"{API_BASE_URL}{path}",
         headers=headers,
+        data=body,
         timeout=REQUEST_TIMEOUT,
     )
+
+
+def _post_signed(path: str) -> requests.Response:
+    return _signed_request("POST", path)
 
 
 def _resolve_target_order_id(
@@ -261,6 +278,98 @@ def request_split(last_order: Any, manual_order_id: Any) -> str:
         return _render_request_error("请求异常", str(exc), path)
 
     return _render_financial_response(response, kind="split", path=path)
+
+
+def load_park_settings() -> tuple[Any, Any, str]:
+    path = "/api/park-settings"
+    try:
+        response = requests.get(f"{API_BASE_URL}{path}", timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        return (
+            gr.update(),
+            gr.update(),
+            _status_card("warning", "无法读取园区配置", html.escape(str(exc))),
+        )
+    if response.status_code != 200:
+        return (
+            gr.update(),
+            gr.update(),
+            _render_request_error(
+                f"读取园区配置失败（HTTP {response.status_code}）",
+                _response_detail(response) or "后端未返回错误信息。",
+                path,
+            ),
+        )
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return (
+            gr.update(),
+            gr.update(),
+            _status_card("error", "园区配置格式错误", "后端返回内容无法解析。"),
+        )
+    allow = bool(data.get("refund_after_lifecycle"))
+    hours = int(data.get("refund_window_hours", 72))
+    return (
+        gr.update(value=allow),
+        gr.update(value=hours),
+        _status_card(
+            "info",
+            "园区配置已加载",
+            f"离园后退款：{'允许' if allow else '不允许'} · "
+            f"退款窗口：{hours} 小时",
+        ),
+    )
+
+
+def save_park_settings(allow: Any, hours: Any) -> str:
+    try:
+        hours_value = int(float(hours))
+    except (TypeError, ValueError):
+        return _status_card(
+            "error", "配置无效", "退款窗口必须为 0–8760 的整数小时。"
+        )
+    if not 0 <= hours_value <= 8760:
+        return _status_card(
+            "error", "配置无效", "退款窗口必须为 0–8760 的整数小时。"
+        )
+
+    path = "/api/park-settings"
+    body = json.dumps(
+        {
+            "refund_after_lifecycle": bool(allow),
+            "refund_window_hours": hours_value,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    try:
+        response = _signed_request("PUT", path, body)
+    except requests.ConnectionError:
+        return _render_request_error(
+            "无法连接后端", f"请确认已启动 python main.py（{API_BASE_URL}）。", path
+        )
+    except requests.Timeout:
+        return _render_request_error(
+            "请求超时", f"后端在 {REQUEST_TIMEOUT:g} 秒内没有响应。", path
+        )
+    except requests.RequestException as exc:
+        return _render_request_error("请求异常", str(exc), path)
+
+    if response.status_code == 200:
+        return _status_card(
+            "success",
+            "园区配置已保存",
+            f"离园后退款：{'允许' if allow else '不允许'} · "
+            f"退款窗口：{hours_value} 小时",
+        )
+    return _render_request_error(
+        f"保存失败（HTTP {response.status_code}）",
+        _response_detail(response) or "后端未返回错误信息。",
+        path,
+    )
 
 
 def _reset_error(
@@ -1152,6 +1261,97 @@ def _status_item_html(
     )
 
 
+LIFECYCLE_STATUS_META = {
+    "not_applicable": ("不适用", "is-na"),
+    "not_started": ("未入园", "is-not-started"),
+    "active": ("游园中", "is-active"),
+    "completed": ("已结束", "is-completed"),
+}
+
+
+def _local_time_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
+
+
+def _fetch_order_lifecycle(order_id: int | None) -> dict[str, Any] | None:
+    if order_id is None:
+        return None
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/api/order/{int(order_id)}/lifecycle",
+            timeout=min(REQUEST_TIMEOUT, 2),
+        )
+    except (requests.RequestException, TypeError, ValueError):
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _render_lifecycle_html(data: dict[str, Any] | None) -> str:
+    if not isinstance(data, dict):
+        return ""
+    status = str(data.get("status") or "")
+    label, css_class = LIFECYCLE_STATUS_META.get(
+        status, ("状态未知", "is-na")
+    )
+    chips = []
+    if data.get("can_split"):
+        chips.append('<span class="lifecycle-chip is-ok">可分账</span>')
+    else:
+        chips.append(
+            '<span class="lifecycle-chip is-wait">分账待生命周期结束</span>'
+        )
+    if data.get("can_refund"):
+        chips.append('<span class="lifecycle-chip is-ok">可退款</span>')
+    else:
+        chips.append('<span class="lifecycle-chip is-muted">不可退款</span>')
+
+    meta_parts = []
+    entered = _local_time_label(data.get("entered_at"))
+    exited = _local_time_label(data.get("exited_at"))
+    leave_at = _local_time_label(data.get("leave_at"))
+    deadline = _local_time_label(data.get("refund_deadline"))
+    if entered:
+        meta_parts.append(f"入园 {entered}")
+    if exited:
+        meta_parts.append(f"离园 {exited}")
+    elif leave_at:
+        meta_parts.append(f"闭园 {leave_at}")
+    if deadline:
+        meta_parts.append(f"退款截止 {deadline}")
+
+    message = html.escape(str(data.get("message") or ""))
+    meta_html = (
+        f'<div class="lifecycle-meta">{" · ".join(meta_parts)}</div>'
+        if meta_parts
+        else ""
+    )
+    return (
+        '<div class="lifecycle-panel">'
+        '<div class="lifecycle-head">'
+        f'<span class="lifecycle-badge {css_class}">{label}</span>'
+        f'{"".join(chips)}'
+        "</div>"
+        f'<div class="lifecycle-message">{message}</div>'
+        f"{meta_html}"
+        "</div>"
+    )
+
+
 def _render_order_status(state: Any) -> str:
     """
     渲染【我的订单状态】区域。
@@ -1274,6 +1474,7 @@ def _render_order_status(state: Any) -> str:
         item_html[label] for label, _item, _status in included_items
     )
 
+    lifecycle_html = _render_lifecycle_html(_fetch_order_lifecycle(order_id))
     return (
         '<div class="status-panel">'
         '<div class="status-panel-head">'
@@ -1282,6 +1483,7 @@ def _render_order_status(state: Any) -> str:
         "</div>"
         f'<div class="status-items">{items_html}</div>'
         f'<p class="status-tip">{tip}</p>'
+        f"{lifecycle_html}"
         "</div>"
     )
 
@@ -1293,6 +1495,7 @@ _QR_NOTE_HTML = (
     "<strong>【越野车】</strong>需分别扫码核销。"
     "请先在检票口核销门票，之后才能前往咖啡馆和越野车体验区；"
     "每次核销后请妥善保留此码。</p>"
+    "<p>离园时请在景区出口扫码登记；再次入园需重新购票。</p>"
     "</div>"
 )
 
@@ -1612,9 +1815,8 @@ def _lookup_order_items(order_id: int) -> list[dict[str, Any]] | None:
 
 
 def _post_config(post_label: Any) -> dict[str, str]:
-    """把下拉框的中文岗位名映射为后端 post 参数；未知值回退到景区检票员。"""
     label = str(post_label or "").strip()
-    return VERIFY_POSTS.get(label, VERIFY_POSTS[DEFAULT_VERIFY_POST])
+    return SCAN_POSTS.get(label, SCAN_POSTS[DEFAULT_VERIFY_POST])
 
 
 def _overlay_html(kind: str, headline: str) -> str:
@@ -1671,6 +1873,67 @@ def _response_detail(response: requests.Response) -> str:
     return json.dumps(detail, ensure_ascii=False)
 
 
+def _submit_exit_request(
+    seed_record_id: int,
+    *,
+    origin: str = "",
+) -> tuple[str, str]:
+    exit_url = f"{API_BASE_URL}/api/verify-records/{seed_record_id}/exit"
+    logger.info("调用离园接口：POST %s（来源：%s）", exit_url, origin or "出口扫码")
+    try:
+        response = requests.post(exit_url, timeout=REQUEST_TIMEOUT)
+    except requests.ConnectionError:
+        return _verification_result(
+            "error", "离园登记失败",
+            f"无法连接后端（{html.escape(API_BASE_URL)}），请联系现场技术人员。",
+            "❌ 离园登记失败，请检查网络后重试",
+        )
+    except requests.Timeout:
+        return _verification_result(
+            "error", "离园登记失败",
+            f"后端在 {REQUEST_TIMEOUT:g} 秒内没有响应，请稍后重试。",
+            "❌ 离园登记失败，请稍后重试",
+        )
+    except requests.RequestException:
+        return _verification_result(
+            "error", "离园登记失败", "离园请求异常，请稍后重试。",
+            "❌ 离园登记失败，请稍后重试",
+        )
+
+    if response.status_code == 200:
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        message = str(body.get("message") or "离园登记成功。")
+        detail = html.escape(message)
+        if body.get("can_split"):
+            detail += "<br><b>生命周期已结束，可以进行分账。</b>"
+        else:
+            detail += "<br>生命周期尚未结束，暂不可分账。"
+        return _verification_result(
+            "success", "离园登记成功", detail, "👋 离园登记成功"
+        )
+
+    detail_text = _response_detail(response)
+    if response.status_code == 409:
+        return _verification_result(
+            "warning", "尚未入园，无法离园",
+            html.escape(detail_text) or "请先核销门票入园。",
+            "⚠️ 尚未入园，无法离园",
+        )
+    if response.status_code == 404:
+        return _verification_result(
+            "error", "未找到这张门票",
+            "请让游客重新出示购票二维码，或到售票处核验订单。",
+            "❌ 未找到这张门票",
+        )
+    return _verification_result(
+        "error", "离园登记失败", "离园系统暂时不可用，请稍后重试。",
+        "❌ 离园登记失败，请稍后重试",
+    )
+
+
 def _submit_verify_request(
     seed_record_id: int,
     post_label: Any,
@@ -1686,6 +1949,8 @@ def _submit_verify_request(
     返回 (页面内状态卡片 HTML, 全屏现场反馈 HTML)，不再抛出 gr.Error。
     """
     config = _post_config(post_label)
+    if config["key"] == "exit":
+        return _submit_exit_request(seed_record_id, origin=origin)
     post_key = config["key"]
     post_name = str(post_label or DEFAULT_VERIFY_POST)
     verify_url = f"{API_BASE_URL}/api/verify-records/{seed_record_id}/verify"
@@ -2293,6 +2558,19 @@ footer,
     box-shadow: 0 14px 32px rgba(74, 84, 63, 0.08);
     animation: scan-pop 0.2s ease-out;
 }
+.lifecycle-panel { margin-top: 12px; padding: 12px 14px; border-radius: 12px; background: #f8fafc; border: 1px solid #e2e8f0; }
+.lifecycle-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lifecycle-badge { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; }
+.lifecycle-badge.is-active { background: #ecfdf5; color: #047857; }
+.lifecycle-badge.is-completed { background: #eff6ff; color: #1d4ed8; }
+.lifecycle-badge.is-not-started { background: #fffbeb; color: #b45309; }
+.lifecycle-badge.is-na { background: #f1f5f9; color: #475569; }
+.lifecycle-chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #f1f5f9; color: #475569; }
+.lifecycle-chip.is-ok { background: #ecfdf5; color: #047857; }
+.lifecycle-chip.is-wait { background: #fffbeb; color: #b45309; }
+.lifecycle-chip.is-muted { background: #f1f5f9; color: #64748b; }
+.lifecycle-message { margin-top: 8px; font-size: 13px; color: #334155; line-height: 1.5; }
+.lifecycle-meta { margin-top: 6px; font-size: 12px; color: #64748b; }
 .status-panel-empty {
     background: #fbfaf6;
     border-style: dashed;
@@ -2846,13 +3124,14 @@ with gr.Blocks(title="乡村文旅电子门票") as demo:
                     "· 景区检票员：只核销门票\n\n"
                     "· 咖啡店员：只核销精品咖啡（须先完成门票核销）\n\n"
                     "· 越野车安全员：只核销越野车体验（须先完成门票核销）\n\n"
+                    "· 景区出口：登记离园；离园后按园区配置决定未核销项目是否还能退款\n\n"
                     "> 首次使用如未出现画面，请点击摄像头区域并允许浏览器使用摄像头。"
                 )
                 verify_post = gr.Dropdown(
-                    choices=list(VERIFY_POSTS.keys()),
+                    choices=list(SCAN_POSTS.keys()),
                     value=DEFAULT_VERIFY_POST,
                     label="当前核销岗位",
-                    info="系统只核销该岗位对应的项目，不会按顺序自动核销下一项",
+                    info="系统只处理该岗位对应的项目，不会按顺序自动处理下一项",
                     interactive=True,
                     scale=1,
                     min_width=260,
@@ -2918,8 +3197,8 @@ with gr.Blocks(title="乡村文旅电子门票") as demo:
                     "### 🧾 订单服务\n"
                     "签名请求头（`X-Timestamp` / `X-Signature`）由前端自动生成；"
                     "请确保前后端 `API_SIGNING_SECRET` 一致。\n\n"
-                    "分账仅结算“已核销”子项；未核销 / 已退款子项记 0 元。"
-                    "部分退款后，已核销子项仍可单独分账；"
+                    "分账仅结算“已核销”子项；只有生命周期结束后才能分账。"
+                    "离园后是否允许退款由园区配置决定；"
                     "已分账订单不可再退款。"
                 )
                 order_id_input = gr.Number(
@@ -2939,6 +3218,35 @@ with gr.Blocks(title="乡村文旅电子门票") as demo:
                         variant="secondary",
                         size="lg",
                     )
+                gr.Markdown(
+                    "### 🏞️ 游园生命周期与退款规则\n"
+                    "分账只在生命周期结束后执行；离园或闭园后，"
+                    "未核销项目是否还能退款由下面的园区配置决定。"
+                )
+                with gr.Row():
+                    refund_after_lifecycle = gr.Checkbox(
+                        label="离园后仍允许退款",
+                        value=False,
+                        info="关闭时，离园/闭园后未核销项目立即不可退款",
+                    )
+                    refund_window_hours = gr.Number(
+                        label="离园后退款窗口（小时）",
+                        value=72,
+                        precision=0,
+                        minimum=0,
+                        maximum=8760,
+                        info="从离园/闭园时间起算，默认 72 小时",
+                    )
+                settings_button = gr.Button(
+                    "💾 保存园区配置",
+                    variant="secondary",
+                    size="lg",
+                )
+                settings_result = gr.HTML(
+                    value="",
+                    padding=False,
+                    container=False,
+                )
                 # 报错使用带内联样式的红色卡片，需关闭 HTML 净化。
                 action_result = gr.Markdown(
                     value=_ACTION_PLACEHOLDER,
@@ -2996,6 +3304,17 @@ with gr.Blocks(title="乡村文旅电子门票") as demo:
         inputs=[last_order, order_id_input],
         outputs=action_result,
         api_name="request_split",
+    )
+    settings_button.click(
+        save_park_settings,
+        inputs=[refund_after_lifecycle, refund_window_hours],
+        outputs=settings_result,
+        api_name="save_park_settings",
+    )
+    demo.load(
+        load_park_settings,
+        inputs=None,
+        outputs=[refund_after_lifecycle, refund_window_hours, settings_result],
     )
     # 摄像头持续推流：服务端每 0.6 秒解析一帧，识别到二维码立即核销。
     # 同一会话的流事件串行执行，避免现场重复提交。
