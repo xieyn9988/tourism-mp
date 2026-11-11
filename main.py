@@ -125,7 +125,8 @@ import secrets
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, time as dt_time, timedelta, timezone
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from enum import Enum as PyEnum
 from pathlib import Path
@@ -215,6 +216,217 @@ SessionLocal = sessionmaker(
 )
 
 
+# ===========================================================================
+# 游园生命周期时间工具
+# ===========================================================================
+
+PARK_TZ = timezone(timedelta(hours=8))
+DEFAULT_PARK_CLOSE_TIME = "18:00"
+
+
+def _parse_park_close_time(raw: str) -> dt_time:
+    try:
+        hour_text, minute_text = raw.strip().split(":", 1)
+        parsed = dt_time(int(hour_text), int(minute_text))
+    except (AttributeError, TypeError, ValueError):
+        logger.warning("PARK_CLOSE_TIME 格式无效：%r，回退到 %s", raw, DEFAULT_PARK_CLOSE_TIME)
+        return dt_time(18, 0)
+    return parsed
+
+
+PARK_CLOSE_TIME = _parse_park_close_time(
+    os.getenv("PARK_CLOSE_TIME", DEFAULT_PARK_CLOSE_TIME)
+)
+
+
+def _utcnow_naive() -> datetime:
+    """当前 UTC 时间，去掉 tzinfo，与 SQLite 中存储的 naive UTC 一致。"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _as_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _to_park_local(value: datetime) -> datetime:
+    return _as_utc_naive(value).replace(tzinfo=timezone.utc).astimezone(PARK_TZ)
+
+
+def _today_closing_at(now: datetime) -> datetime:
+    """返回 now 所在北京日期的闭园时刻，转成 naive UTC。"""
+    local = _to_park_local(now)
+    closing_local = local.replace(
+        hour=PARK_CLOSE_TIME.hour,
+        minute=PARK_CLOSE_TIME.minute,
+        second=0,
+        microsecond=0,
+    )
+    return closing_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _format_park_time(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    return _to_park_local(value).strftime("%Y-%m-%d %H:%M")
+
+
+def evaluate_lifecycle(
+    *,
+    entered_at: datetime | None,
+    exited_at: datetime | None,
+    has_ticket: bool,
+    has_pending_items: bool,
+    refund_after_lifecycle: bool,
+    refund_window_hours: int,
+    now: datetime | None = None,
+) -> LifecycleSnapshot:
+    """根据订单字段、子项状态、园区配置与当前时间计算生命周期快照。
+
+    leave_at = min(exited_at, 入园当天的闭园时刻)，全部使用 naive UTC 比较。
+    """
+    now_value = _utcnow_naive() if now is None else _as_utc_naive(now)
+
+    if not has_ticket:
+        return LifecycleSnapshot(
+            status=LifecycleStatus.NOT_APPLICABLE,
+            reason=LifecycleReason.NOT_APPLICABLE,
+            entered_at=None,
+            exited_at=None,
+            leave_at=None,
+            refund_deadline=None,
+            can_verify=True,
+            can_refund=has_pending_items,
+            can_split=True,
+            message="订单不含门票，不适用游园生命周期，可直接按已核销项目分账。",
+        )
+
+    if entered_at is None:
+        today_closing = _today_closing_at(now_value)
+        if now_value < today_closing:
+            return LifecycleSnapshot(
+                status=LifecycleStatus.NOT_STARTED,
+                reason=LifecycleReason.NOT_ENTERED,
+                entered_at=None,
+                exited_at=None,
+                leave_at=None,
+                refund_deadline=None,
+                can_verify=True,
+                can_refund=has_pending_items,
+                can_split=False,
+                message="门票尚未核销，生命周期未开始；核销门票后开始计算游园时间。",
+            )
+        return LifecycleSnapshot(
+            status=LifecycleStatus.NOT_STARTED,
+            reason=LifecycleReason.PARK_CLOSED,
+            entered_at=None,
+            exited_at=None,
+            leave_at=None,
+            refund_deadline=None,
+            can_verify=False,
+            can_refund=has_pending_items,
+            can_split=False,
+            message=(
+                f"景区已闭园（{_format_park_time(today_closing)}），"
+                "今日无法检票入园，请明日再来。"
+            ),
+        )
+
+    entered_value = _as_utc_naive(entered_at)
+    exited_value = None if exited_at is None else _as_utc_naive(exited_at)
+    closing_at = _today_closing_at(entered_value)
+    leave_at = closing_at if exited_value is None else min(exited_value, closing_at)
+
+    if not has_pending_items:
+        return LifecycleSnapshot(
+            status=LifecycleStatus.COMPLETED,
+            reason=LifecycleReason.ALL_ITEMS_SETTLED,
+            entered_at=entered_value,
+            exited_at=exited_value,
+            leave_at=leave_at,
+            refund_deadline=None,
+            can_verify=False,
+            can_refund=False,
+            can_split=True,
+            message="生命周期已结束：全部子项均已核销或已退款，可以进行分账。",
+        )
+
+    if refund_after_lifecycle:
+        deadline = leave_at + timedelta(hours=refund_window_hours)
+        if now_value >= deadline:
+            return LifecycleSnapshot(
+                status=LifecycleStatus.COMPLETED,
+                reason=LifecycleReason.REFUND_WINDOW_EXPIRED,
+                entered_at=entered_value,
+                exited_at=exited_value,
+                leave_at=leave_at,
+                refund_deadline=deadline,
+                can_verify=False,
+                can_refund=False,
+                can_split=True,
+                message=(
+                    "生命周期已结束：离园后退款窗口已于 "
+                    f"{_format_park_time(deadline)} 到期。"
+                ),
+            )
+        if now_value >= leave_at:
+            return LifecycleSnapshot(
+                status=LifecycleStatus.ACTIVE,
+                reason=LifecycleReason.POST_LEAVE_REFUND_WINDOW,
+                entered_at=entered_value,
+                exited_at=exited_value,
+                leave_at=leave_at,
+                refund_deadline=deadline,
+                can_verify=False,
+                can_refund=True,
+                can_split=False,
+                message=(
+                    "游客已离园或景区已闭园；未核销项目可退款至 "
+                    f"{_format_park_time(deadline)}，"
+                    "退款窗口结束或全部子项终态后方可分账。"
+                ),
+            )
+        return LifecycleSnapshot(
+            status=LifecycleStatus.ACTIVE,
+            reason=LifecycleReason.IN_PARK,
+            entered_at=entered_value,
+            exited_at=exited_value,
+            leave_at=leave_at,
+            refund_deadline=deadline,
+            can_verify=True,
+            can_refund=True,
+            can_split=False,
+            message="游客在园内，生命周期进行中；离园或全部子项终态后方可分账。",
+        )
+
+    if now_value >= leave_at:
+        return LifecycleSnapshot(
+            status=LifecycleStatus.COMPLETED,
+            reason=LifecycleReason.POST_LEAVE_REFUND_DISABLED,
+            entered_at=entered_value,
+            exited_at=exited_value,
+            leave_at=leave_at,
+            refund_deadline=None,
+            can_verify=False,
+            can_refund=False,
+            can_split=True,
+            message="生命周期已结束：游客已离园或景区已闭园，且园区配置为离园后不再退款。",
+        )
+    return LifecycleSnapshot(
+        status=LifecycleStatus.ACTIVE,
+        reason=LifecycleReason.IN_PARK,
+        entered_at=entered_value,
+        exited_at=exited_value,
+        leave_at=leave_at,
+        refund_deadline=None,
+        can_verify=True,
+        can_refund=True,
+        can_split=False,
+        message="游客在园内，生命周期进行中；离园或全部子项终态后方可分账。",
+    )
+
+
 def get_db():
     """FastAPI 依赖：每个请求创建一个 Session，请求结束后自动关闭。"""
     db = SessionLocal()
@@ -277,6 +489,44 @@ class VerifyPost(str, PyEnum):
     GATE = "gate"        # 景区检票员：核销门票
     COFFEE = "coffee"    # 咖啡店员：核销精品咖啡
     OFFROAD = "offroad"  # 越野车安全员：核销越野车体验
+
+
+class LifecycleStatus(str, PyEnum):
+    """订单的游园生命周期状态（派生状态，不落库）。"""
+
+    NOT_APPLICABLE = "not_applicable"  # 订单不含门票
+    NOT_STARTED = "not_started"        # 含门票但尚未入园
+    ACTIVE = "active"                  # 已入园，游园进行中
+    COMPLETED = "completed"            # 生命周期已结束，允许分账
+
+
+class LifecycleReason(str, PyEnum):
+    """生命周期状态的具体原因，用于前端文案与排查。"""
+
+    NOT_APPLICABLE = "not_applicable"
+    NOT_ENTERED = "not_entered"
+    PARK_CLOSED = "park_closed"
+    IN_PARK = "in_park"
+    POST_LEAVE_REFUND_WINDOW = "post_leave_refund_window"
+    ALL_ITEMS_SETTLED = "all_items_settled"
+    REFUND_WINDOW_EXPIRED = "refund_window_expired"
+    POST_LEAVE_REFUND_DISABLED = "post_leave_refund_disabled"
+
+
+@dataclass(frozen=True)
+class LifecycleSnapshot:
+    """一次生命周期判定的完整快照。"""
+
+    status: LifecycleStatus
+    reason: LifecycleReason
+    entered_at: datetime | None
+    exited_at: datetime | None
+    leave_at: datetime | None
+    refund_deadline: datetime | None
+    can_verify: bool
+    can_refund: bool
+    can_split: bool
+    message: str
 
 
 # ===========================================================================

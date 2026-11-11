@@ -23,18 +23,14 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import tempfile
 import uuid
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-# 必须在导入 main 之前切换数据库，main.py 在模块加载时读取 DATABASE_URL。
-TEST_DB = Path(tempfile.gettempdir()) / f"tourism_split_guard_{os.getpid()}.db"
-if TEST_DB.exists():
-    TEST_DB.unlink()
-os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB.as_posix()}"
+# 测试数据库由 conftest.py 统一配置，main.py 在导入时读取 DATABASE_URL。
+TEST_DB = Path(os.environ["DATABASE_URL"].removeprefix("sqlite:///"))
 
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine, select  # noqa: E402
@@ -171,9 +167,6 @@ def _count_split_items(order_id: int) -> int:
 def client():
     with TestClient(backend.app) as test_client:
         yield test_client
-    backend.engine.dispose()
-    if TEST_DB.exists():
-        TEST_DB.unlink()
 
 
 def test_refunded_order_without_verified_items_cannot_split(client: TestClient):
