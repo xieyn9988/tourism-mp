@@ -478,3 +478,67 @@ def test_verify_blocked_after_visit_ends(client, frozen_now):
     )
     assert verify.status_code == 409, verify.text
     assert "重新购票" in verify.json()["detail"]
+
+
+def _exit_path(record_id: int) -> str:
+    return f"/api/verify-records/{record_id}/exit"
+
+
+def test_exit_requires_entry(client):
+    order_id = _make_order(
+        [("门票", backend.VerifyStatus.UNVERIFIED)],
+        total_amount=Decimal("80.00"),
+        lifecycle="not_started",
+    )
+    response = client.post(_exit_path(_record_id(order_id, "门票")))
+    assert response.status_code == 409, response.text
+    assert "尚未入园" in response.json()["detail"]
+
+
+def test_exit_is_idempotent_and_completes_lifecycle(client, frozen_now):
+    _set_park_settings(False, 72)
+    order_id = _make_order(
+        [
+            ("门票", backend.VerifyStatus.VERIFIED),
+            ("咖啡", backend.VerifyStatus.VERIFIED),
+            ("越野车", backend.VerifyStatus.UNVERIFIED),
+        ],
+        lifecycle="active",
+    )
+    path = _exit_path(_record_id(order_id, "门票"))
+
+    first = client.post(path)
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["status"] == "completed"
+    assert body["reason"] == "post_leave_refund_disabled"
+    assert body["exited_at"].startswith("2026-11-11T04:00:00")
+    assert body["can_split"] is True
+    assert body["can_refund"] is False
+
+    second = client.post(path)
+    assert second.status_code == 200, second.text
+    assert second.json()["exited_at"] == body["exited_at"]
+
+
+def test_post_leave_refund_window_reports_deadline(client, frozen_now):
+    _set_park_settings(True, 72)
+    order_id = _make_order(
+        [("门票", backend.VerifyStatus.VERIFIED), ("咖啡", backend.VerifyStatus.UNVERIFIED)],
+        total_amount=Decimal("120.00"),
+        lifecycle="active",
+    )
+
+    response = client.post(_exit_path(_record_id(order_id, "门票")))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "active"
+    assert body["reason"] == "post_leave_refund_window"
+    assert body["refund_deadline"].startswith("2026-11-14T04:00:00")
+    assert body["can_refund"] is True
+    assert body["can_verify"] is False
+    assert body["can_split"] is False
+
+    queried = client.get(f"/api/order/{order_id}/lifecycle")
+    assert queried.status_code == 200
+    assert queried.json() == body

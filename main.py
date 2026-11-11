@@ -922,6 +922,22 @@ class ParkSettingsUpdate(BaseModel):
     refund_window_hours: int = Field(ge=0, le=8760)
 
 
+class LifecycleOut(BaseModel):
+    order_id: int
+    status: LifecycleStatus
+    reason: LifecycleReason
+    entered_at: datetime | None = None
+    exited_at: datetime | None = None
+    leave_at: datetime | None = None
+    refund_deadline: datetime | None = None
+    refund_after_lifecycle: bool
+    refund_window_hours: int
+    can_verify: bool
+    can_refund: bool
+    can_split: bool
+    message: str
+
+
 # ===========================================================================
 # 五、接口签名验证（HMAC-SHA256）
 # ===========================================================================
@@ -1302,6 +1318,28 @@ def _verify_blocked_message(snapshot: LifecycleSnapshot) -> str:
     if snapshot.status == LifecycleStatus.NOT_STARTED:
         return snapshot.message
     return "本次游园已结束，如需再次入园请重新购票。"
+
+
+def _to_lifecycle_out(
+    order: Order,
+    settings: ParkSettings,
+    snapshot: LifecycleSnapshot,
+) -> LifecycleOut:
+    return LifecycleOut(
+        order_id=order.id,
+        status=snapshot.status,
+        reason=snapshot.reason,
+        entered_at=snapshot.entered_at,
+        exited_at=snapshot.exited_at,
+        leave_at=snapshot.leave_at,
+        refund_deadline=snapshot.refund_deadline,
+        refund_after_lifecycle=bool(settings.refund_after_lifecycle),
+        refund_window_hours=int(settings.refund_window_hours),
+        can_verify=snapshot.can_verify,
+        can_refund=snapshot.can_refund,
+        can_split=snapshot.can_split,
+        message=snapshot.message,
+    )
 
 
 # 岗位 -> 该岗位负责核销的项目关键字（与现场业务口径保持一致）。
@@ -2809,6 +2847,50 @@ def verify_record(
         post.value if post is not None else "legacy",
     )
     return record
+
+
+@app.get(
+    "/api/order/{order_id}/lifecycle",
+    response_model=LifecycleOut,
+    tags=["生命周期"],
+    summary="查询订单游园生命周期",
+)
+def get_order_lifecycle(order_id: int, db: DbSession) -> LifecycleOut:
+    order = _load_order_with_records(db, order_id)
+    settings = _load_park_settings(db)
+    snapshot = _order_lifecycle(order, settings)
+    return _to_lifecycle_out(order, settings, snapshot)
+
+
+@app.post(
+    "/api/verify-records/{record_id}/exit",
+    response_model=LifecycleOut,
+    tags=["生命周期"],
+    summary="出口扫码离园登记（幂等）",
+)
+def register_exit(record_id: int, db: DbSession) -> LifecycleOut:
+    seed = db.get(VerifyRecord, record_id)
+    if seed is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="核销记录不存在",
+        )
+    order = _load_order_with_records(db, seed.order_id)
+    settings = _load_park_settings(db)
+
+    if order.entered_at is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="门票尚未核销，游客尚未入园，无法办理离园登记",
+        )
+
+    if order.exited_at is None:
+        order.exited_at = _utcnow_naive()
+        db.commit()
+        logger.info("离园登记：order_id=%s, exited_at=%s", order.id, order.exited_at)
+
+    snapshot = _order_lifecycle(order, settings)
+    return _to_lifecycle_out(order, settings, snapshot)
 
 
 @app.post(
