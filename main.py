@@ -79,7 +79,7 @@
 
 5. 门票使用生命周期（实现分账 / 退款 / 核销的业务前置条件）
    - 门票核销即入园，记录 orders.entered_at；
-   - 出口扫码记录 orders.exited_at；闭园时间由 PARK_CLOSE_TIME 控制（默认 18:00）；
+   - 出口扫码记录 orders.exited_at；闭园时间取订单门票商户的 merchants.close_time（默认 23:59:59）；
    - leave_at = min(exited_at, 入园当天闭园时间)；
    - 全部子项终态（verified / refunded）立即结束；
    - 仍有未核销子项时：若允许离园后退款，则在 leave_at + refund_window_hours
@@ -162,7 +162,7 @@ from typing import Annotated, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import status as http_status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -916,7 +916,21 @@ class MerchantOut(BaseModel):
     id: int
     name: str
     split_rate: float
+    open_time: str
+    close_time: str
     created_at: datetime
+
+
+class MerchantHoursUpdate(BaseModel):
+    open_time: str = Field(max_length=8)
+    close_time: str = Field(max_length=8)
+
+    @field_validator("open_time", "close_time")
+    @classmethod
+    def _valid_clock(cls, value: str) -> str:
+        if _parse_clock_time(value) is None:
+            raise ValueError("时间格式应为 HH:MM 或 HH:MM:SS")
+        return value.strip()
 
 
 class ProductOut(BaseModel):
@@ -2769,6 +2783,30 @@ def reset_demo(db: DbSession, _: RequireSignature) -> DemoResetResultOut:
 @app.get("/api/merchants", response_model=list[MerchantOut], tags=["商户"], summary="商户列表")
 def list_merchants(db: DbSession):
     return db.scalars(select(Merchant).order_by(Merchant.id)).all()
+
+
+@app.patch(
+    "/api/merchants/{merchant_id}/business-hours",
+    response_model=MerchantOut,
+    tags=["商户"],
+    summary="更新商户营业时间",
+)
+def update_merchant_business_hours(
+    merchant_id: int,
+    payload: MerchantHoursUpdate,
+    db: DbSession,
+):
+    merchant = db.get(Merchant, merchant_id)
+    if merchant is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="商户不存在",
+        )
+    merchant.open_time = payload.open_time
+    merchant.close_time = payload.close_time
+    db.commit()
+    db.refresh(merchant)
+    return merchant
 
 
 @app.get("/api/products", response_model=list[ProductOut], tags=["商品"], summary="商品列表")
