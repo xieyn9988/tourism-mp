@@ -77,7 +77,20 @@
    - 只要本次产生退款，订单状态原子迁移为 refunded，防止重复退款；
    - 部分退款后，已核销子项仍可调用分账接口单独结算。
 
-5. 一键重置演示环境：POST /api/demo/reset（需 HMAC 签名）
+5. 门票使用生命周期（实现分账 / 退款 / 核销的业务前置条件）
+   - 门票核销即入园，记录 orders.entered_at；
+   - 出口扫码记录 orders.exited_at；闭园时间由 PARK_CLOSE_TIME 控制（默认 18:00）；
+   - leave_at = min(exited_at, 入园当天闭园时间)；
+   - 全部子项终态（verified / refunded）立即结束；
+   - 仍有未核销子项时：若允许离园后退款，则在 leave_at + refund_window_hours
+     后结束；若不允许，则在 leave_at 结束后立即结束；
+   - 生命周期结束（completed）或订单不含门票（not_applicable）才允许分账；
+   - 结束后不可退款、不可再次核销；再次入园必须重新购票；
+   - 查询：GET /api/order/{order_id}/lifecycle；
+   - 离园：POST /api/verify-records/{record_id}/exit（幂等、无需签名）；
+   - 运营配置：GET /api/park-settings；PUT /api/park-settings（需签名）。
+
+6. 一键重置演示环境：POST /api/demo/reset（需 HMAC 签名）
    - 清空 orders / verify_records / split_records 历史数据；
    - 自动创建一张 paid + 三项均 unverified 的测试订单；
    - 返回新订单 ID、订单号与门票核销记录 ID，供演示直接扫码。
@@ -97,12 +110,26 @@
       （paid / refunded → split）完成原子状态迁移，同一订单只会生成一条
       分账流水；多实例部署下由条件 UPDATE + split_records 唯一约束兜底。
 
+游园生命周期状态机
+==================
+
+    生命周期        可分账  可退款  可核销  说明
+    not_applicable   ✓       ✓*      ✓      订单不含门票
+    not_started      ✗       ✓*      ✓(门票) 未入园；闭园后不可检票
+    active(园内)      ✗       ✓       ✓      游园中
+    active(离园窗口)  ✗       ✓       ✗      已离园/闭园，等待退款窗口结束
+    completed        ✓       ✗       ✗      生命周期结束，必须重新购票才能再入园
+
+    * 可退款还要求订单为 paid、至少一个未核销子项，且未分账。
+
 数据库迁移与多实例扩展性
 ========================
 - SQLite 不支持修改 CHECK 约束，启动时通过 schema_migrations 执行一次性
   表重建迁移，为 orders.status 增加 split、为 verify_records.verify_status
   增加 refunded；另以 ALTER TABLE 为 split_records 增加 split_amount。
   迁移幂等且保留历史数据。
+- 另以 ALTER TABLE 为 orders 增加 entered_at / exited_at，并对已核销门票的
+  历史订单用最早核销时间回填 entered_at；park_settings 为新建单行配置表。
 - 资金动作的状态迁移使用条件 UPDATE + 唯一约束，不依赖进程内锁，
   可直接扩展到多实例部署。
 - 若切换 PostgreSQL / MySQL，orders.status 的枚举变更应交给 Alembic
