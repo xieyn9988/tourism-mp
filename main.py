@@ -2789,12 +2789,13 @@ def list_merchants(db: DbSession):
     "/api/merchants/{merchant_id}/business-hours",
     response_model=MerchantOut,
     tags=["商户"],
-    summary="更新商户营业时间",
+    summary="更新商户营业时间（需 HMAC 签名）",
 )
 def update_merchant_business_hours(
     merchant_id: int,
     payload: MerchantHoursUpdate,
     db: DbSession,
+    _: RequireSignature,
 ):
     merchant = db.get(Merchant, merchant_id)
     if merchant is None:
