@@ -10,7 +10,7 @@ import json
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -542,3 +542,71 @@ def test_post_leave_refund_window_reports_deadline(client, frozen_now):
     queried = client.get(f"/api/order/{order_id}/lifecycle")
     assert queried.status_code == 200
     assert queried.json() == body
+
+
+OLD_MERCHANTS_DDL = """
+CREATE TABLE merchants (
+    id INTEGER NOT NULL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    split_rate NUMERIC(5, 4) NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+"""
+
+
+def test_parse_clock_time_supports_hh_mm_and_hh_mm_ss():
+    assert backend._parse_clock_time("08:00") == dt_time(8, 0)
+    assert backend._parse_clock_time("23:59:59") == dt_time(23, 59, 59)
+    assert backend._parse_clock_time(" 18:30 ") == dt_time(18, 30)
+    assert backend._parse_clock_time("abc") is None
+    assert backend._parse_clock_time("25:00") is None
+    assert backend._parse_clock_time(None) is None
+
+
+def test_merchant_business_hours_migration(tmp_path: Path):
+    db_path = tmp_path / "old_merchants.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        OLD_MERCHANTS_DDL
+        + """
+        INSERT INTO merchants (id, name, split_rate)
+            VALUES (1, 'OLD-MERCHANT', 0.05);
+        """
+    )
+    conn.close()
+
+    old_engine = backend.create_engine(f"sqlite:///{db_path.as_posix()}")
+    try:
+        backend._migrate_merchant_business_hours(old_engine)
+        with old_engine.begin() as db_conn:
+            columns = {
+                row[1]
+                for row in db_conn.exec_driver_sql("PRAGMA table_info(merchants)")
+            }
+            assert {"open_time", "close_time"} <= columns
+            row = db_conn.exec_driver_sql(
+                "SELECT name, open_time, close_time FROM merchants WHERE id = 1"
+            ).one()
+            assert tuple(row) == ("OLD-MERCHANT", "08:00", "23:59:59")
+
+        backend._migrate_merchant_business_hours(old_engine)
+        with old_engine.begin() as db_conn:
+            versions = {
+                row[0]
+                for row in db_conn.exec_driver_sql(
+                    "SELECT version FROM schema_migrations"
+                )
+            }
+            assert backend.MERCHANT_BUSINESS_HOURS_MIGRATION in versions
+    finally:
+        old_engine.dispose()
+
+
+def test_seeded_merchants_have_default_business_hours(client):
+    with backend.SessionLocal() as db:
+        merchants = db.scalars(backend.select(backend.Merchant)).all()
+    assert merchants
+    for merchant in merchants:
+        assert merchant.open_time == "08:00"
+        assert merchant.close_time == "23:59:59"

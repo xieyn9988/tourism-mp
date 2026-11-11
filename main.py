@@ -248,7 +248,26 @@ SessionLocal = sessionmaker(
 # ===========================================================================
 
 PARK_TZ = timezone(timedelta(hours=8))
+DEFAULT_OPEN_TIME = "08:00"
+DEFAULT_CLOSE_TIME = "23:59:59"
+DEFAULT_CLOSE_TIME_VALUE = dt_time(23, 59, 59)
 DEFAULT_PARK_CLOSE_TIME = "18:00"
+
+
+def _parse_clock_time(raw: str | None) -> dt_time | None:
+    """解析 HH:MM 或 HH:MM:SS；格式/范围非法时返回 None。"""
+    if not raw:
+        return None
+    parts = raw.strip().split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+        second = int(parts[2]) if len(parts) == 3 else 0
+        return dt_time(hour, minute, second)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_park_close_time(raw: str) -> dt_time:
@@ -608,6 +627,16 @@ class Merchant(TimestampMixin, Base):
         nullable=False,
         default=Decimal("0"),
         comment="平台抽成比例，0 ~ 1",
+    )
+    open_time: Mapped[str] = mapped_column(
+        String(8), nullable=False, default=DEFAULT_OPEN_TIME,
+        server_default=DEFAULT_OPEN_TIME,
+        comment="营业开始时间，北京时间 HH:MM 或 HH:MM:SS",
+    )
+    close_time: Mapped[str] = mapped_column(
+        String(8), nullable=False, default=DEFAULT_CLOSE_TIME,
+        server_default=DEFAULT_CLOSE_TIME,
+        comment="闭园时间，北京时间 HH:MM 或 HH:MM:SS",
     )
 
     # 一对多：一个商户拥有多个商品；删除商户时级联删除其商品。
@@ -2508,6 +2537,38 @@ def _migrate_order_lifecycle_columns(bind: Engine) -> None:
         logger.info("orders 表已补充生命周期字段 entered_at / exited_at")
 
 
+MERCHANT_BUSINESS_HOURS_MIGRATION = "20261111_05_merchant_business_hours"
+
+
+def _migrate_merchant_business_hours(bind: Engine) -> None:
+    """为旧库 merchants 表补充 open_time / close_time（SQLite ALTER TABLE）。"""
+    if bind.dialect.name != "sqlite":
+        logger.info("非 SQLite 数据库，请使用 Alembic 执行 merchants 营业时间迁移")
+        return
+    with bind.begin() as conn:
+        _ensure_schema_migrations_table(conn)
+        has_merchants = conn.exec_driver_sql(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='merchants'"
+        ).first()
+        if has_merchants is None:
+            return
+        columns = {
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(merchants)")
+        }
+        if "open_time" not in columns:
+            conn.exec_driver_sql(
+                "ALTER TABLE merchants ADD COLUMN open_time VARCHAR(8) "
+                "NOT NULL DEFAULT '08:00'"
+            )
+        if "close_time" not in columns:
+            conn.exec_driver_sql(
+                "ALTER TABLE merchants ADD COLUMN close_time VARCHAR(8) "
+                "NOT NULL DEFAULT '23:59:59'"
+            )
+        _record_migration(conn, MERCHANT_BUSINESS_HOURS_MIGRATION)
+        logger.info("merchants 表已补充营业时间字段 open_time / close_time")
+
+
 def _backfill_order_entry_times(bind: Engine) -> None:
     """历史订单若已核销门票但缺少 entered_at，用最早一次门票核销时间回填。"""
     if bind.dialect.name != "sqlite":
@@ -2573,6 +2634,7 @@ def initialize_database() -> None:
     _migrate_verify_status_refunded(engine)
     _migrate_split_amount_column(engine)
     _migrate_order_lifecycle_columns(engine)
+    _migrate_merchant_business_hours(engine)
     Base.metadata.create_all(bind=engine)
     _backfill_split_order_status(engine)
     _backfill_order_entry_times(engine)
