@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import uuid
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -68,8 +69,8 @@ def _create_order(
     verified: bool = False,
     item_name: str = "门票",
     total_amount: Decimal = Decimal("100.00"),
+    lifecycle: str = "completed",
 ) -> int:
-    """直接写库创建一张带核销记录的订单，避免依赖接口签名创建订单。"""
     return _create_order_with_items(
         status,
         [
@@ -81,6 +82,7 @@ def _create_order(
             )
         ],
         total_amount=total_amount,
+        lifecycle=lifecycle,
     )
 
 
@@ -89,19 +91,33 @@ def _create_order_with_items(
     items: list[tuple[str, backend.VerifyStatus]],
     *,
     total_amount: Decimal = Decimal("200.00"),
+    lifecycle: str = "completed",
 ) -> int:
-    """创建一张包含多个核销子项的订单，子项按项目名归属各自商户。"""
+    now = backend._utcnow_naive()
+    if lifecycle == "completed":
+        entered_at, exited_at = now - timedelta(days=10), now - timedelta(days=9)
+    elif lifecycle == "not_started":
+        entered_at, exited_at = None, None
+    elif lifecycle == "active":
+        entered_at, exited_at = now, None
+    elif lifecycle == "post_leave":
+        entered_at, exited_at = now - timedelta(hours=2), now - timedelta(hours=1)
+    else:
+        raise ValueError(f"未知 lifecycle: {lifecycle}")
+
     with backend.SessionLocal() as db:
         merchants = {
             merchant.name: merchant
             for merchant in db.scalars(select(backend.Merchant)).all()
         }
-        assert merchants, "seed_data 应已初始化商户"
+        assert merchants, "seed_data 已初始化商户"
 
         order = backend.Order(
             order_no=f"TEST-{status.value}-{uuid.uuid4().hex[:12]}",
             total_amount=total_amount,
             status=status,
+            entered_at=entered_at,
+            exited_at=exited_at,
         )
         db.add(order)
         db.flush()
@@ -120,6 +136,31 @@ def _create_order_with_items(
             )
         db.commit()
         return int(order.id)
+
+
+def _set_park_settings(
+    refund_after_lifecycle: bool,
+    refund_window_hours: int = 72,
+) -> None:
+    with backend.SessionLocal() as db:
+        settings = backend._load_park_settings(db)
+        settings.refund_after_lifecycle = refund_after_lifecycle
+        settings.refund_window_hours = refund_window_hours
+        db.commit()
+
+
+@pytest.fixture(autouse=True)
+def _reset_park_settings(client):
+    """每个测试都从默认配置开始，避免测试间互相污染。"""
+    _set_park_settings(False, 72)
+    yield
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    fixed = datetime(2026, 11, 11, 4, 0, 0)
+    monkeypatch.setattr(backend, "_utcnow_naive", lambda: fixed)
+    return fixed
 
 
 def _record_statuses(order_id: int) -> dict[str, str]:
@@ -223,8 +264,9 @@ def test_partial_verification_splits_verified_items_only(client: TestClient):
     assert _count_split_items(order_id) == 3
 
 
-def test_partial_refund_then_split_verified_items(client: TestClient):
+def test_partial_refund_then_split_verified_items(client: TestClient, frozen_now):
     """业务主线：核销门票 + 咖啡，退款越野车后，仍可对 120 元分账。"""
+    _set_park_settings(True, 72)
     order_id = _create_order_with_items(
         backend.OrderStatus.PAID,
         [
@@ -232,6 +274,7 @@ def test_partial_refund_then_split_verified_items(client: TestClient):
             ("咖啡", backend.VerifyStatus.VERIFIED),
             ("越野车", backend.VerifyStatus.UNVERIFIED),
         ],
+        lifecycle="active",
     )
 
     refund = _signed_request(client, "POST", _refund_path(order_id))
@@ -308,8 +351,13 @@ def test_split_order_cannot_refund(client: TestClient):
         assert db.get(backend.Order, order_id).status == backend.OrderStatus.SPLIT
 
 
-def test_all_unverified_refund_marks_refunded_and_blocks_split(client: TestClient):
-    order_id = _create_order(backend.OrderStatus.PAID, verified=False)
+def test_all_unverified_refund_marks_refunded_and_blocks_split(
+    client: TestClient, frozen_now
+):
+    _set_park_settings(True, 72)
+    order_id = _create_order(
+        backend.OrderStatus.PAID, verified=False, lifecycle="active"
+    )
     refund_path = _refund_path(order_id)
 
     refund = _signed_request(client, "POST", refund_path)
@@ -574,3 +622,102 @@ def test_split_amount_column_migration(tmp_path: Path):
         backend._migrate_split_amount_column(old_engine)
     finally:
         old_engine.dispose()
+
+
+def test_split_blocked_while_in_park(client: TestClient, frozen_now):
+    _set_park_settings(False, 72)
+    order_id = _create_order_with_items(
+        backend.OrderStatus.PAID,
+        [
+            ("门票", backend.VerifyStatus.VERIFIED),
+            ("咖啡", backend.VerifyStatus.VERIFIED),
+            ("越野车", backend.VerifyStatus.UNVERIFIED),
+        ],
+        lifecycle="active",
+    )
+    response = _signed_request(client, "POST", _split_path(order_id))
+    assert response.status_code == 409, response.text
+    assert "生命周期" in response.json()["detail"]
+    assert _count_split_records(order_id) == 0
+
+
+def test_post_leave_refund_then_all_items_terminal_allows_split(
+    client: TestClient, frozen_now
+):
+    _set_park_settings(True, 72)
+    order_id = _create_order_with_items(
+        backend.OrderStatus.PAID,
+        [("门票", backend.VerifyStatus.VERIFIED), ("咖啡", backend.VerifyStatus.UNVERIFIED)],
+        total_amount=Decimal("120.00"),
+        lifecycle="active",
+    )
+    with backend.SessionLocal() as db:
+        records = {
+            record.item_name: int(record.id)
+            for record in db.scalars(
+                select(backend.VerifyRecord).where(
+                    backend.VerifyRecord.order_id == order_id
+                )
+            )
+        }
+
+    exit_response = client.post(
+        f"/api/verify-records/{records['门票']}/exit"
+    )
+    assert exit_response.status_code == 200, exit_response.text
+
+    blocked = client.post(
+        f"/api/verify-records/{records['咖啡']}/verify",
+        params={"post": "coffee"},
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert "重新购票" in blocked.json()["detail"]
+
+    refund = _signed_request(client, "POST", _refund_path(order_id))
+    assert refund.status_code == 200, refund.text
+    assert refund.json()["refund_amount"] == "36.00"
+
+    lifecycle = client.get(f"/api/order/{order_id}/lifecycle").json()
+    assert lifecycle["status"] == "completed"
+    assert lifecycle["reason"] == "all_items_settled"
+
+    split = _signed_request(client, "POST", _split_path(order_id))
+    assert split.status_code == 200, split.text
+    assert split.json()["split_amount"] == "80.00"
+
+
+def test_refund_blocked_after_lifecycle_completed(client: TestClient, frozen_now):
+    _set_park_settings(False, 72)
+    order_id = _create_order_with_items(
+        backend.OrderStatus.PAID,
+        [("门票", backend.VerifyStatus.VERIFIED), ("咖啡", backend.VerifyStatus.UNVERIFIED)],
+        lifecycle="completed",
+    )
+    response = _signed_request(client, "POST", _refund_path(order_id))
+    assert response.status_code == 409, response.text
+    assert "生命周期已结束" in response.json()["detail"]
+
+
+def test_refund_blocked_after_refund_window_expires(client: TestClient, frozen_now):
+    _set_park_settings(True, 0)
+    order_id = _create_order_with_items(
+        backend.OrderStatus.PAID,
+        [("门票", backend.VerifyStatus.VERIFIED), ("咖啡", backend.VerifyStatus.UNVERIFIED)],
+        lifecycle="post_leave",
+    )
+    response = _signed_request(client, "POST", _refund_path(order_id))
+    assert response.status_code == 409, response.text
+    assert "退款窗口" in response.json()["detail"]
+
+
+def test_non_ticket_order_splits_without_lifecycle(client: TestClient):
+    _set_park_settings(False, 72)
+    order_id = _create_order_with_items(
+        backend.OrderStatus.PAID,
+        [("咖啡", backend.VerifyStatus.VERIFIED)],
+        total_amount=Decimal("40.00"),
+        lifecycle="not_started",
+    )
+    response = _signed_request(client, "POST", _split_path(order_id))
+    assert response.status_code == 200, response.text
+    assert response.json()["split_amount"] == "40.00"

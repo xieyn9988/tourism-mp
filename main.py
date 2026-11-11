@@ -2945,6 +2945,14 @@ def split_order(
             detail="订单没有可分账项目",
         )
 
+    settings = _load_park_settings(db)
+    lifecycle = _order_lifecycle(order, settings)
+    if not lifecycle.can_split:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=lifecycle.message,
+        )
+
     # 分账池 = 已核销子项。未核销 / 已退款子项记 0，不参与抽成与结算。
     verified_items = [
         record
@@ -3192,6 +3200,14 @@ def refund_order(
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="订单没有可退款项目",
+        )
+
+    settings = _load_park_settings(db)
+    lifecycle = _order_lifecycle(order, settings)
+    if not lifecycle.can_refund:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=lifecycle.message,
         )
 
     result = _build_refund_result(db, order)
