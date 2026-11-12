@@ -47,6 +47,10 @@ def _refund_path(order_id: int) -> str:
     return f"/api/order/{order_id}/refund"
 
 
+def _settlement_path(order_id: int) -> str:
+    return f"/api/order/{order_id}/exit-settlement"
+
+
 def _signed_request(client: TestClient, method: str, path: str):
     """按完整 path（含 query string）生成签名并发起请求。"""
     return client.request(
@@ -573,6 +577,50 @@ def test_verify_status_refunded_migration(tmp_path: Path):
         old_engine.dispose()
 
 
+def test_verify_status_expired_migration(tmp_path: Path):
+    """旧库 verify_records 迁移后允许 expired，并保留历史数据。"""
+    db_path = tmp_path / "old_verify_expired.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        OLD_VERIFY_RECORDS_DDL
+        + """
+        CREATE INDEX ix_verify_records_order_id ON verify_records (order_id);
+        INSERT INTO verify_records
+            (id, order_id, merchant_id, item_name, verify_status)
+            VALUES (1, 1, 1, '门票', 'verified');
+        """
+    )
+    conn.close()
+
+    old_engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    try:
+        backend._migrate_verify_status_expired(old_engine)
+
+        with old_engine.begin() as db_conn:
+            ddl = db_conn.exec_driver_sql(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='verify_records'"
+            ).scalar()
+            assert ddl is not None and "'expired'" in ddl
+            assert "'refunded'" in ddl
+            assert (
+                db_conn.exec_driver_sql(
+                    "SELECT verify_status FROM verify_records WHERE id = 1"
+                ).scalar()
+                == "verified"
+            )
+            db_conn.exec_driver_sql(
+                "INSERT INTO verify_records "
+                "(order_id, merchant_id, item_name, verify_status) "
+                "VALUES (2, 2, '咖啡', 'expired')"
+            )
+
+        # 迁移幂等。
+        backend._migrate_verify_status_expired(old_engine)
+    finally:
+        old_engine.dispose()
+
+
 def test_split_amount_column_migration(tmp_path: Path):
     """旧分账流水增加 split_amount，并按历史口径回填为订单总额。"""
     db_path = tmp_path / "old_split.db"
@@ -695,7 +743,8 @@ def test_refund_blocked_after_lifecycle_completed(client: TestClient, frozen_now
     )
     response = _signed_request(client, "POST", _refund_path(order_id))
     assert response.status_code == 409, response.text
-    assert "生命周期已结束" in response.json()["detail"]
+    # 园区“离园后不允许退款”是最高优先级，优先于“生命周期已结束”提示。
+    assert "园区规定离园后不允许退款" in response.json()["detail"]
 
 
 def test_refund_blocked_after_refund_window_expires(client: TestClient, frozen_now):
@@ -721,3 +770,109 @@ def test_non_ticket_order_splits_without_lifecycle(client: TestClient):
     response = _signed_request(client, "POST", _split_path(order_id))
     assert response.status_code == 200, response.text
     assert response.json()["split_amount"] == "40.00"
+
+
+def _record_id_by_item(order_id: int, item_name: str) -> int:
+    with backend.SessionLocal() as db:
+        record_id = db.scalar(
+            select(backend.VerifyRecord.id).where(
+                backend.VerifyRecord.order_id == order_id,
+                backend.VerifyRecord.item_name == item_name,
+            )
+        )
+    assert record_id is not None
+    return int(record_id)
+
+
+def test_exit_settlement_expires_unused_items_and_splits(
+    client: TestClient, frozen_now
+):
+    """离园结算：未核销子项过期，已核销子项分账，未消费金额留在平台。"""
+    order_id = _create_order_with_items(
+        backend.OrderStatus.PAID,
+        [
+            ("门票", backend.VerifyStatus.VERIFIED),
+            ("咖啡", backend.VerifyStatus.UNVERIFIED),
+            ("越野车", backend.VerifyStatus.UNVERIFIED),
+        ],
+        lifecycle="active",
+    )
+
+    response = _signed_request(client, "POST", _settlement_path(order_id))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["order_status"] == "split"
+    assert body["exited_at"] is not None
+    assert body["expired_item_count"] == 2
+    # 咖啡 40.00 + 越野车 80.00 均未使用，整笔留在平台。
+    assert body["expired_amount"] == "120.00"
+    assert body["forfeited_amount"] == "120.00"
+    assert body["split_amount"] == "80.00"
+    # 平台留存 = 门票抽成 4.00 + 过期金额 120.00。
+    assert body["platform_retention"] == "124.00"
+    assert body["merchant_income_total"] == "76.00"
+    assert "已过期" in body["message"]
+
+    # 未核销子项全部进入终态 expired，不再停留在“部分核销”。
+    assert _record_statuses(order_id) == {
+        "门票": "verified",
+        "咖啡": "expired",
+        "越野车": "expired",
+    }
+    assert _count_split_records(order_id) == 1
+
+    items = {item["item_name"]: item for item in body["items"]}
+    assert items["门票"]["split_eligible"] is True
+    assert items["门票"]["merchant_income"] == "76.00"
+    assert items["咖啡"]["verify_status"] == "expired"
+    assert items["咖啡"]["split_eligible"] is False
+    assert items["咖啡"]["amount"] == "40.00"
+    assert items["咖啡"]["platform_commission"] == "40.00"
+    assert items["咖啡"]["merchant_income"] == "0.00"
+
+    # 重复结算与结算后退款都必须被拦截。
+    assert (
+        _signed_request(client, "POST", _settlement_path(order_id)).status_code
+        == 409
+    )
+    assert (
+        _signed_request(client, "POST", _refund_path(order_id)).status_code
+        in (409, 400)
+    )
+
+
+def test_expired_item_cannot_be_verified(client: TestClient, frozen_now):
+    order_id = _create_order_with_items(
+        backend.OrderStatus.PAID,
+        [
+            ("门票", backend.VerifyStatus.VERIFIED),
+            ("咖啡", backend.VerifyStatus.UNVERIFIED),
+        ],
+        lifecycle="active",
+    )
+    assert (
+        _signed_request(client, "POST", _settlement_path(order_id)).status_code
+        == 200
+    )
+
+    coffee_id = _record_id_by_item(order_id, "咖啡")
+    response = client.post(f"/api/verify-records/{coffee_id}/verify")
+
+    assert response.status_code == 409, response.text
+    # 结算后订单已是 split 终态，核销入口会优先拒绝。
+    assert "不允许核销" in response.json()["detail"]
+
+
+def test_exit_settlement_rejects_order_not_entered(client: TestClient):
+    order_id = _create_order_with_items(
+        backend.OrderStatus.PAID,
+        [("门票", backend.VerifyStatus.UNVERIFIED)],
+        lifecycle="not_started",
+    )
+
+    response = _signed_request(client, "POST", _settlement_path(order_id))
+
+    assert response.status_code == 409, response.text
+    assert "尚未入园" in response.json()["detail"]
+    assert _count_split_records(order_id) == 0

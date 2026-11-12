@@ -90,7 +90,15 @@
    - 离园：POST /api/verify-records/{record_id}/exit（幂等、无需签名）；
    - 运营配置：GET /api/park-settings；PUT /api/park-settings（需签名）。
 
-6. 一键重置演示环境：POST /api/demo/reset（需 HMAC 签名）
+6. 离园结算引擎：POST /api/order/{order_id}/exit-settlement（需签名）
+   - 适用于已入园、尚未分账的订单，解决“已离园但一直卡在部分核销”；
+   - 未登记离园时自动补登 exited_at；
+   - 将所有 unverified 子项强制置为 expired（不可再用、不可退）；
+   - 已核销金额按商户 split_rate 分账给商户；
+   - 已过期金额全额留在平台（forfeited_amount / platform_retention）；
+   - 订单原子迁移为 split，并写入唯一分账流水快照。
+
+7. 一键重置演示环境：POST /api/demo/reset（需 HMAC 签名）
    - 清空 orders / verify_records / split_records 历史数据；
    - 自动创建一张 paid + 三项均 unverified 的测试订单；
    - 返回新订单 ID、订单号与门票核销记录 ID，供演示直接扫码。
@@ -121,6 +129,10 @@
     completed        ✓       ✗       ✗      生命周期结束，必须重新购票才能再入园
 
     * 可退款还要求订单为 paid、至少一个未核销子项，且未分账。
+
+    子项终态：verified（已核销）/ refunded（已退款）/ expired（离园结算过期）。
+    过期子项不可核销、不可退款，金额计入平台留存；离园结算后订单不再存
+    在 unverified 子项。
 
 数据库迁移与多实例扩展性
 ========================
@@ -302,6 +314,29 @@ def _format_park_time(value: datetime | None) -> str:
     return _to_park_local(value).strftime("%Y-%m-%d %H:%M")
 
 
+def _compute_leave_at(
+    entered_at: datetime | None,
+    exited_at: datetime | None,
+    close_time: dt_time | None = None,
+) -> datetime | None:
+    """
+    计算游客的“离园时刻”（naive UTC）。
+
+    leave_at = min(实际扫码离园时间, 入园当天闭园时刻)。
+    未入园返回 None；已入园但未扫码离园时，以闭园时刻作为离园时间。
+    该函数同时被生命周期判定与退款优先级校验复用，避免两处口径漂移。
+    """
+    if entered_at is None:
+        return None
+    entered_value = _as_utc_naive(entered_at)
+    closing_at = _today_closing_at(
+        entered_value, close_time or DEFAULT_CLOSE_TIME_VALUE
+    )
+    if exited_at is None:
+        return closing_at
+    return min(_as_utc_naive(exited_at), closing_at)
+
+
 def evaluate_lifecycle(
     *,
     entered_at: datetime | None,
@@ -368,8 +403,7 @@ def evaluate_lifecycle(
 
     entered_value = _as_utc_naive(entered_at)
     exited_value = None if exited_at is None else _as_utc_naive(exited_at)
-    closing_at = _today_closing_at(entered_value, closing_time)
-    leave_at = closing_at if exited_value is None else min(exited_value, closing_at)
+    leave_at = _compute_leave_at(entered_value, exited_value, closing_time)
 
     if not has_pending_items:
         return LifecycleSnapshot(
@@ -382,7 +416,9 @@ def evaluate_lifecycle(
             can_verify=False,
             can_refund=False,
             can_split=True,
-            message="生命周期已结束：全部子项均已核销或已退款，可以进行分账。",
+            message=(
+                "生命周期已结束：全部子项均已核销、已退款或已过期，可以进行分账。"
+            ),
         )
 
     if refund_after_lifecycle:
@@ -509,11 +545,14 @@ class OrderStatus(str, PyEnum):
 
 
 class VerifyStatus(str, PyEnum):
-    """核销 / 退款状态。"""
+    """核销 / 退款 / 过期状态。"""
 
     UNVERIFIED = "unverified"  # 未核销
     VERIFIED = "verified"      # 已核销
     REFUNDED = "refunded"      # 未核销项目已退款，不再可核销
+    # 离园结算时，仍未被使用、也未退款的子项会被强制置为过期。
+    # 过期项目永久不可核销、不可退款，对应金额留在平台侧。
+    EXPIRED = "expired"        # 已过期（离园结算后作废）
 
 
 class VerifyPost(str, PyEnum):
@@ -778,7 +817,7 @@ class VerifyRecord(TimestampMixin, Base):
         default=VerifyStatus.UNVERIFIED,
         server_default=VerifyStatus.UNVERIFIED.value,
         index=True,
-        comment="核销状态：unverified/verified",
+        comment="核销状态：unverified/verified/refunded/expired",
     )
 
     order: Mapped["Order"] = relationship(back_populates="verify_records")
@@ -1214,8 +1253,11 @@ class SplitResultOut(BaseModel):
     total_amount: Money
     # 分账基数：仅已核销项目的金额合计（未核销 / 已退款项目记 0）。
     split_amount: Money
+    # 平台留存 = 已核销项目的抽成 + 已过期项目的全额留存。
     platform_retention: Money
     merchant_income_total: Money
+    # 离园结算后未使用（expired）子项的金额合计，这部分钱全部留在平台。
+    forfeited_amount: Money = ZERO
     merchants: list[SplitMerchantOut] = Field(default_factory=list)
     items: list[SplitItemOut] = Field(default_factory=list)
 
@@ -1249,6 +1291,15 @@ class SplitRecordPageOut(BaseModel):
     page: int
     page_size: int
     items: list[SplitRecordSummaryOut] = Field(default_factory=list)
+
+
+class ExitSettlementOut(SplitResultOut):
+    """离园结算结果：过期处理 + 一次性分账。"""
+
+    exited_at: datetime | None = None
+    expired_item_count: int = 0
+    expired_amount: Money = ZERO
+    message: str = ""
 
 
 class RefundItemOut(BaseModel):
@@ -1412,6 +1463,35 @@ def _to_lifecycle_out(
     )
 
 
+def _refund_policy_block_reason(
+    order: Order,
+    settings: ParkSettings,
+    close_time: dt_time | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """
+    园区退款政策的最高优先级校验。
+
+    只要园区配置为“离园后不允许退款”，游客一旦离园（或到达闭园时刻），
+    未核销项目就立即不可退款。该判断必须先于任何退款窗口 / 生命周期
+    分支执行，确保历史配置或脏数据不会让 72 小时窗口“复活”。
+    """
+    if bool(settings.refund_after_lifecycle):
+        return None
+    if order.entered_at is None:
+        # 尚未入园：离园政策不生效，仍按未使用订单处理。
+        return None
+
+    now_value = _utcnow_naive() if now is None else _as_utc_naive(now)
+    leave_at = _compute_leave_at(order.entered_at, order.exited_at, close_time)
+    if leave_at is not None and now_value >= leave_at:
+        return (
+            "园区规定离园后不允许退款：游客已离园或景区已闭园，"
+            "未核销项目不可退款。"
+        )
+    return None
+
+
 # 岗位 -> 该岗位负责核销的项目关键字（与现场业务口径保持一致）。
 VERIFY_POST_ITEM_KEYWORDS: dict[VerifyPost, str] = {
     VerifyPost.GATE: "门票",
@@ -1437,7 +1517,8 @@ def _select_record_for_post(order: Order, post: VerifyPost) -> VerifyRecord:
       3. 非检票岗位必须先完成门票核销，否则提示游客先去检票口；
       4. 对应项目已核销时按重复扫码处理，绝不顺带核销其他项目。
     """
-    records = list(order.verify_records)
+    # 只允许使用当前订单自己的核销记录，防止其他订单 / 历史脏数据影响判断。
+    records = [r for r in order.verify_records if r.order_id == order.id]
     if not records:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
@@ -1498,6 +1579,11 @@ def _select_record_for_post(order: Order, post: VerifyPost) -> VerifyRecord:
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
             detail="该票已退款，不可再核销",
+        )
+    if target.verify_status == VerifyStatus.EXPIRED:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="本次游园已结束，未使用项目已过期，如需游玩请重新购票",
         )
     return target
 
@@ -1655,7 +1741,7 @@ def _aggregate_split_merchants(items: list[SplitItemOut]) -> list[SplitMerchantO
     """把项目级分账明细按商户聚合，供实时计算与历史流水查询共用。
 
     只有进入分账池（已核销且金额大于 0）的项目才参与商户聚合：
-    未核销 / 已退款项目虽然保留在项目快照中，但不产生任何商户结算。
+    未核销 / 已退款 / 已过期项目虽然保留在项目快照中，但都不产生商户结算。
     """
     merchant_buckets: dict[int, dict] = {}
 
@@ -1701,18 +1787,40 @@ def _build_split_result(db: Session, order: Order) -> SplitResultOut:
     分账池只包含状态为“已核销”的子项：
       - 已核销：按项目分摊金额参与分账，平台按商户 split_rate 抽成，
         商户实得 = 项目金额 - 平台抽成；
+      - 已过期（expired）：离园结算时强制作废的未使用金额，不参与商户
+        分账，全额计入平台留存（platform_commission = 项目金额）；
       - 未核销 / 已退款：项目金额、平台抽成、商户实得全部记为 0，
         仍保留在项目快照中供对账审计。
+
+    因此：platform_retention = Σ已核销抽成 + Σ已过期金额；
+          split_amount        = Σ已核销项目金额；
+          forfeited_amount    = Σ已过期项目金额（平台留存的一部分）。
     """
     amounts = allocate_item_amounts(db, order)
 
     items: list[SplitItemOut] = []
     for record in order.verify_records:
-        split_eligible = record.verify_status == VerifyStatus.VERIFIED
-        amount = _money(amounts[record.id]) if split_eligible else ZERO
         rate = _to_decimal(record.merchant.split_rate)
-        commission = _money(amount * rate) if split_eligible else ZERO
-        merchant_income = _money(amount - commission)
+        allocated = _money(amounts[record.id])
+
+        if record.verify_status == VerifyStatus.VERIFIED:
+            # 已核销：正常进入分账池。
+            split_eligible = True
+            amount = allocated
+            commission = _money(amount * rate)
+            merchant_income = _money(amount - commission)
+        elif record.verify_status == VerifyStatus.EXPIRED:
+            # 已过期：未使用的钱不退给游客，也不分给商户，整笔留在平台。
+            split_eligible = False
+            amount = allocated
+            commission = amount
+            merchant_income = ZERO
+        else:
+            # 未核销 / 已退款：不参与分账，金额记 0。
+            split_eligible = False
+            amount = ZERO
+            commission = ZERO
+            merchant_income = ZERO
 
         items.append(
             SplitItemOut(
@@ -1729,7 +1837,20 @@ def _build_split_result(db: Session, order: Order) -> SplitResultOut:
             )
         )
 
-    split_amount = _money(sum((item.amount for item in items), ZERO))
+    # 分账基数只统计真正进入分账池的已核销项目；过期金额单独计入平台留存。
+    split_amount = _money(
+        sum((item.amount for item in items if item.split_eligible), ZERO)
+    )
+    forfeited_amount = _money(
+        sum(
+            (
+                item.amount
+                for item in items
+                if item.verify_status == VerifyStatus.EXPIRED
+            ),
+            ZERO,
+        )
+    )
     platform_retention = _money(sum((item.platform_commission for item in items), ZERO))
     merchant_income_total = _money(
         sum((item.merchant_income for item in items), ZERO)
@@ -1743,6 +1864,7 @@ def _build_split_result(db: Session, order: Order) -> SplitResultOut:
         split_amount=split_amount,
         platform_retention=platform_retention,
         merchant_income_total=merchant_income_total,
+        forfeited_amount=forfeited_amount,
         merchants=_aggregate_split_merchants(items),
         items=items,
     )
@@ -1766,6 +1888,17 @@ def _to_split_record_out(record: SplitRecord) -> SplitRecordOut:
         for item in record.items
     ]
 
+    forfeited_amount = _money(
+        sum(
+            (
+                item.amount
+                for item in items
+                if item.verify_status == VerifyStatus.EXPIRED
+            ),
+            ZERO,
+        )
+    )
+
     return SplitRecordOut(
         split_record_id=record.id,
         order_id=record.order_id,
@@ -1775,6 +1908,7 @@ def _to_split_record_out(record: SplitRecord) -> SplitRecordOut:
         split_amount=_money(record.split_amount),
         platform_retention=_money(record.platform_retention),
         merchant_income_total=_money(record.merchant_income_total),
+        forfeited_amount=forfeited_amount,
         merchants=_aggregate_split_merchants(items),
         items=items,
         created_at=record.created_at,
@@ -1814,7 +1948,8 @@ def _build_refund_result(db: Session, order: Order) -> RefundResultOut:
       - 未核销：按项目原始单价退款，扣除 10% 手续费，退款后状态标记为已退款；
       - 已核销：拒绝退款，退款金额固定为 0（仍可参与后续分账）；
       - 已退款：幂等展示，退款金额固定为 0；
-      - 全部已核销：refunded=False，由接口返回 409。
+      - 已过期：拒绝退款，金额已在离园结算时留在平台；
+      - 全部已核销 / 已退款 / 已过期：refunded=False，由接口返回 409。
     """
     amounts = allocate_item_amounts(db, order)
     items: list[RefundItemOut] = []
@@ -1841,6 +1976,18 @@ def _build_refund_result(db: Session, order: Order) -> RefundResultOut:
             result_label = "已退款"
             reason = (
                 f"「{record.item_name}」此前已退款，本次不重复退款，退款 0 元"
+            )
+        elif record.verify_status == VerifyStatus.EXPIRED:
+            # 离园结算后，未使用子项已作废，金额已按规则留在平台；
+            # 过期项目不可退款，避免结算后再次产生资金动作。
+            fee_rate = ZERO
+            refundable = False
+            fee_amount = ZERO
+            refund_amount = ZERO
+            status_label = "已过期"
+            result_label = "不可退款"
+            reason = (
+                f"「{record.item_name}」已在离园结算时过期，不可退款，退款 0 元"
             )
         else:
             fee_rate = _refund_fee_rate(record.item_name)
@@ -1884,7 +2031,9 @@ def _build_refund_result(db: Session, order: Order) -> RefundResultOut:
     refunded = bool(refunded_items)
 
     if not refunded:
-        message = "所有项目均已核销或已退款，不可再退款，各项退款 0 元。"
+        message = (
+            "所有项目均已核销、已退款或已过期，不可再退款，各项退款 0 元。"
+        )
     elif not rejected_items:
         message = (
             f"全部项目均未核销：按原价 {_format_money(refund_gross_amount)} 元"
@@ -2176,24 +2325,35 @@ def _generate_reset_order_no() -> str:
     )
 
 
+def _clear_order_scoped_data(db: Session) -> dict[str, int]:
+    """
+    物理清空所有订单相关表（DELETE，不是软删除）。
+
+    按外键依赖顺序先删子表再删主表，兼容未开启外键级联的数据库；
+    返回各表实际删除行数，便于日志确认“没有任何残留”。
+    """
+    deleted: dict[str, int] = {}
+    for model in (SplitItemRecord, SplitRecord, VerifyRecord, Order):
+        result = db.execute(delete(model))
+        deleted[model.__tablename__] = int(result.rowcount or 0)
+    db.flush()
+    return deleted
+
+
 def reset_demo_environment(db: Session) -> DemoResetResultOut:
     """
     一键重置演示环境。
 
     执行顺序：
-      1. 按外键依赖顺序清空历史分账流水、核销记录与订单；
+      1. 按外键依赖顺序物理清空分账明细、分账流水、核销记录与订单；
       2. 幂等补齐演示商户 / 商品，保证退款金额仍能按原始单价计算；
       3. 创建一张 paid 状态、门票 + 咖啡 + 越野车均 unverified 的新订单。
 
     所有写操作在同一事务内完成；任一步失败都会由调用方回滚，
     不会出现“历史数据已删、新订单却没建出来”的半成品状态。
     """
-    # 1. 清空历史数据（先子表后主表，兼容未开启外键级联的数据库）。
-    db.execute(delete(SplitItemRecord))
-    db.execute(delete(SplitRecord))
-    db.execute(delete(VerifyRecord))
-    db.execute(delete(Order))
-    db.flush()
+    deleted = _clear_order_scoped_data(db)
+    logger.info("重置演示环境：已清空历史数据 %s", deleted)
 
     # 2. 确保演示商户与商品存在，保证 allocate_item_amounts 能取到原始单价。
     merchants_by_name: dict[str, Merchant] = {}
@@ -2378,6 +2538,7 @@ def _migrate_order_status_split(bind: Engine) -> None:
 
 VERIFY_STATUS_REFUNDED_MIGRATION = "20261111_02_verify_status_refunded"
 SPLIT_AMOUNT_COLUMN_MIGRATION = "20261111_03_split_records_split_amount"
+VERIFY_STATUS_EXPIRED_MIGRATION = "20261111_06_verify_status_expired"
 
 
 def _migrate_verify_status_refunded(bind: Engine) -> None:
@@ -2479,6 +2640,108 @@ def _migrate_verify_status_refunded(bind: Engine) -> None:
 
         logger.info(
             "数据库迁移完成：verify_records.verify_status 新增 refunded 状态"
+        )
+
+
+def _migrate_verify_status_expired(bind: Engine) -> None:
+    """
+    为 verify_records.verify_status 的 CHECK 约束增加 expired 值。
+
+    离园结算会把未使用子项置为 expired，SQLite 无法 ALTER CHECK，
+    因此沿用“新表 → 拷贝 → 替换”的原地重建方式；迁移幂等且保留数据。
+    执行顺序必须在 refunded 迁移之后，旧库会依次获得两个新状态。
+    """
+    if bind.dialect.name != "sqlite":
+        logger.info(
+            "非 SQLite 数据库，请使用 Alembic 执行 verify_records 过期状态迁移"
+        )
+        return
+
+    with bind.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        row = conn.exec_driver_sql(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='verify_records'"
+        ).first()
+        if row is None:
+            # 全新数据库由 create_all 按最新模型建表。
+            return
+
+        table_sql = str(row[0] or "")
+        if "'expired'" in table_sql:
+            _record_migration(conn, VERIFY_STATUS_EXPIRED_MIGRATION)
+            return
+
+        columns = (
+            "id, order_id, merchant_id, item_name, verify_status, "
+            "created_at, updated_at"
+        )
+
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        try:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                locked_row = conn.exec_driver_sql(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='table' AND name='verify_records'"
+                ).first()
+                locked_sql = str(locked_row[0] or "") if locked_row else ""
+                if not locked_sql:
+                    conn.exec_driver_sql("COMMIT")
+                    return
+                if "'expired'" in locked_sql:
+                    _record_migration(conn, VERIFY_STATUS_EXPIRED_MIGRATION)
+                    conn.exec_driver_sql("COMMIT")
+                    return
+
+                new_sql, replaced = re.subn(
+                    r"CHECK \(verify_status IN \([^)]*\)\)",
+                    "CHECK (verify_status IN "
+                    "('unverified', 'verified', 'refunded', 'expired'))",
+                    locked_sql,
+                    count=1,
+                )
+                if replaced != 1:
+                    raise RuntimeError(
+                        "无法识别 verify_records.verify_status 检查约束，迁移中止"
+                    )
+                new_sql = new_sql.replace(
+                    "CREATE TABLE verify_records",
+                    "CREATE TABLE verify_records_new",
+                    1,
+                )
+
+                conn.exec_driver_sql(new_sql)
+                conn.exec_driver_sql(
+                    f"INSERT INTO verify_records_new ({columns}) "
+                    f"SELECT {columns} FROM verify_records"
+                )
+                conn.exec_driver_sql("DROP TABLE verify_records")
+                conn.exec_driver_sql(
+                    "ALTER TABLE verify_records_new RENAME TO verify_records"
+                )
+                # 重建原表的普通索引；唯一约束已随建表 SQL 一并复制。
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_verify_records_order_id "
+                    "ON verify_records (order_id)"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_verify_records_merchant_id "
+                    "ON verify_records (merchant_id)"
+                )
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_verify_records_verify_status "
+                    "ON verify_records (verify_status)"
+                )
+                _record_migration(conn, VERIFY_STATUS_EXPIRED_MIGRATION)
+                conn.exec_driver_sql("COMMIT")
+            except Exception:
+                conn.exec_driver_sql("ROLLBACK")
+                raise
+        finally:
+            conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+        logger.info(
+            "数据库迁移完成：verify_records.verify_status 新增 expired 状态"
         )
 
 
@@ -2646,6 +2909,7 @@ def initialize_database() -> None:
     """
     _migrate_order_status_split(engine)
     _migrate_verify_status_refunded(engine)
+    _migrate_verify_status_expired(engine)
     _migrate_split_amount_column(engine)
     _migrate_order_lifecycle_columns(engine)
     _migrate_merchant_business_hours(engine)
@@ -2892,12 +3156,20 @@ def verify_record(
             "后端会按岗位只核销对应子项；不传则保持旧的“核销指定记录”行为。"
         ),
     ),
+    order_id: int | None = Query(
+        default=None,
+        description=(
+            "当前订单 ID（可选但推荐）。传入时，record_id 必须属于该订单，"
+            "且所有子项状态只从该订单的核销记录读取，避免旧订单 / 历史数据串单。"
+        ),
+    ),
 ):
     """
     将一条核销记录从“未核销”改为“已核销”。
 
     业务约束：
       - 记录必须存在；
+      - 显式传入 order_id 时，票号必须属于该订单；
       - 已核销的记录不能重复核销（防止重复消耗）；
       - 已退款的记录不能再核销（防止退款后继续使用）；
       - 只有“已支付”的订单才允许核销；
@@ -2911,11 +3183,15 @@ def verify_record(
             detail="核销记录不存在",
         )
 
-    order = (
-        _load_order_with_records(db, seed.order_id)
-        if post is not None
-        else seed.order
-    )
+    # 统一以“本次订单”为作用域：order_id 显式传入时以它为准，
+    # 否则使用票号所属订单。后续所有状态判断只读该订单的核销记录。
+    target_order_id = order_id if order_id is not None else seed.order_id
+    order = _load_order_with_records(db, target_order_id)
+    if seed.order_id != order.id:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="票号与订单不匹配，请使用当前订单的二维码",
+        )
     if order.status != OrderStatus.PAID:
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
@@ -2947,6 +3223,11 @@ def verify_record(
             raise HTTPException(
                 status_code=http_status.HTTP_409_CONFLICT,
                 detail="该核销项已退款，不可再核销",
+            )
+        if record.verify_status == VerifyStatus.EXPIRED:
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail="本次游园已结束，未使用项目已过期，如需游玩请重新购票",
             )
     else:
         # 新逻辑：二维码只提供“这是哪张订单”，由岗位决定核销哪个子项。
@@ -3044,6 +3325,184 @@ def register_exit(record_id: int, db: DbSession) -> LifecycleOut:
         close_time=_resolve_order_close_time(db, order),
     )
     return _to_lifecycle_out(order, settings, snapshot)
+
+
+@app.post(
+    "/api/order/{order_id}/exit-settlement",
+    response_model=ExitSettlementOut,
+    tags=["生命周期"],
+    summary="离园结算：过期未使用子项并立即分账（需 HMAC 签名）",
+)
+def settle_order_on_exit(
+    order_id: int,
+    db: DbSession,
+    _: RequireSignature,
+) -> ExitSettlementOut:
+    """
+    离园结算引擎：解决“已离园但订单永远卡在部分核销”的资损 / 对账问题。
+
+    触发前提：
+      - 订单已支付（或部分退款后仍待结算），且尚未生成分账流水；
+      - 游客已完成门票核销（entered_at 非空）。
+
+    执行步骤（全部处于同一数据库事务）：
+      1. 未登记离园时，以当前时间补登 exited_at；
+      2. 把所有 unverified 子项强制置为 expired（未使用即作废）；
+      3. 已核销子项按商户 split_rate 正常分账，商户实得入账；
+      4. 已过期子项金额全额计入平台留存（forfeited_amount），不退款、
+         不分给商户；
+      5. 订单状态条件 UPDATE 为 split，并写入唯一分账流水快照。
+
+    结算完成后，订单只可能是 verified / expired / refunded 三种终态，
+    生命周期立即结束，不会再停留在“部分核销”。
+
+    受签名保护：请求头需携带 X-Timestamp / X-Signature。
+    """
+    order = _load_order_with_records(db, order_id)
+
+    if order.status == OrderStatus.UNPAID:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="订单未支付，不能进行离园结算",
+        )
+    if order.status == OrderStatus.SPLIT:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="该订单已完成离园结算，不能重复结算",
+        )
+    if not order.verify_records:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="订单没有可结算项目",
+        )
+    if order.entered_at is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="游客尚未入园，无法办理离园结算",
+        )
+
+    # 兼容历史数据：状态仍为 paid/refunded 但已存在流水时，直接拒绝。
+    existing_split_id = db.scalar(
+        select(SplitRecord.id).where(SplitRecord.order_id == order.id)
+    )
+    if existing_split_id is not None:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="该订单已生成分账流水，不能重复结算",
+        )
+
+    now_value = _utcnow_naive()
+    if order.exited_at is None:
+        # 一键离园结算：现场没有单独扫码离园时，以结算时间补登。
+        order.exited_at = now_value
+
+    # 核心动作 1：所有未核销子项立即作废，绝不允许继续停留在 unverified。
+    expired_records = [
+        record
+        for record in order.verify_records
+        if record.verify_status == VerifyStatus.UNVERIFIED
+    ]
+    for record in expired_records:
+        record.verify_status = VerifyStatus.EXPIRED
+
+    # 核心动作 2：重新计算分账。expired 子项金额整笔计入平台留存。
+    result = _build_split_result(db, order)
+
+    # 核心动作 3：条件 UPDATE 原子迁移为 split，防止并发重复结算。
+    updated = db.execute(
+        update(Order)
+        .where(
+            Order.id == order.id,
+            Order.status.in_([OrderStatus.PAID, OrderStatus.REFUNDED]),
+        )
+        .values(status=OrderStatus.SPLIT)
+        .execution_options(synchronize_session=False)
+    )
+    if updated.rowcount != 1:
+        db.rollback()
+        latest_status = db.scalar(select(Order.status).where(Order.id == order.id))
+        if latest_status == OrderStatus.SPLIT:
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail="该订单已完成离园结算，不能重复结算",
+            )
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="订单状态已变化，离园结算未执行，请刷新后重试",
+        )
+
+    # 保持会话内对象与数据库一致（expire_on_commit=False）。
+    order.status = OrderStatus.SPLIT
+
+    split_record = SplitRecord(
+        order_id=order.id,
+        total_amount=result.total_amount,
+        split_amount=result.split_amount,
+        platform_retention=result.platform_retention,
+        merchant_income_total=result.merchant_income_total,
+        # 结算项目数 = 已核销分账项 + 已过期项。
+        item_count=sum(
+            1
+            for item in result.items
+            if item.split_eligible
+            or item.verify_status == VerifyStatus.EXPIRED
+        ),
+    )
+    split_record.items = [
+        SplitItemRecord(
+            verify_record_id=item.verify_record_id,
+            item_name=item.item_name,
+            merchant_id=item.merchant_id,
+            merchant_name=item.merchant_name,
+            verify_status=item.verify_status.value,
+            amount=item.amount,
+            split_rate=item.split_rate,
+            platform_commission=item.platform_commission,
+            merchant_income=item.merchant_income,
+        )
+        for item in result.items
+    ]
+    db.add(split_record)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        logger.warning("重复离园结算被唯一约束拦截：order_id=%s", order_id)
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="该订单已完成离园结算，不能重复结算",
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("离园结算落库失败：order_id=%s", order_id)
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="离园结算保存失败，请稍后重试",
+        )
+
+    result = result.model_copy(update={"order_status": OrderStatus.SPLIT})
+    message = (
+        f"离园结算完成：{len(expired_records)} 个未使用项目已过期，"
+        f"过期金额 {_format_money(result.forfeited_amount)} 元留在平台；"
+        f"已核销项目分账 {_format_money(result.split_amount)} 元。"
+    )
+    logger.info(
+        "离园结算完成：order_id=%s, expired=%s, forfeited=%s, split=%s, "
+        "platform_retention=%s, split_record_id=%s",
+        order.id,
+        len(expired_records),
+        _format_money(result.forfeited_amount),
+        _format_money(result.split_amount),
+        _format_money(result.platform_retention),
+        split_record.id,
+    )
+    return ExitSettlementOut(
+        **result.model_dump(),
+        exited_at=order.exited_at,
+        expired_item_count=len(expired_records),
+        expired_amount=result.forfeited_amount,
+        message=message,
+    )
 
 
 @app.post(
@@ -3360,10 +3819,25 @@ def refund_order(
         )
 
     settings = _load_park_settings(db)
+    close_time = _resolve_order_close_time(db, order)
+    now_value = _utcnow_naive()
+
+    # 最高优先级：园区配置“离园后不允许退款”时，先于生命周期判断直接拒绝。
+    # 这样即使 refund_window_hours 仍保留 72 小时的历史值，也不会被误用。
+    policy_block = _refund_policy_block_reason(
+        order, settings, close_time=close_time, now=now_value
+    )
+    if policy_block:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=policy_block,
+        )
+
     lifecycle = _order_lifecycle(
         order,
         settings,
-        close_time=_resolve_order_close_time(db, order),
+        now=now_value,
+        close_time=close_time,
     )
     if not lifecycle.can_refund:
         raise HTTPException(

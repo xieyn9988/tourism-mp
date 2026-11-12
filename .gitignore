@@ -1,5 +1,5 @@
 __pycache__/
-*.py[cod]
+*.pyc
 .pytest_cache/
-*.db
-.claude/settings.local.json
+tourism.db
+.env

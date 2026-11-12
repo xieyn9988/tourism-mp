@@ -1,20 +1,18 @@
 """
-乡村文旅电子门票 —— Gradio + 摄像头扫码 + 二维码购票
-=====================================================
+乡村文旅电子门票 —— 游客购票 / 商家人工核销 / 运营结算
+=======================================================
 
-两个页面：
-    1. 游客端：购买门票，生成电子门票二维码；
-       购票后还可以“申请退款”和“执行分账”；
-    2. 商家端：摄像头持续识别游客二维码，识别成功即自动核销，无需点击提交；
-       现场先选择【当前核销岗位】（景区检票员 / 咖啡店员 / 越野车安全员），
-       系统只核销该岗位对应的子项，不再按顺序自动核销下一项；
-       现场光线影响摄像头时，可在“备用演示区”手动输入电子票号 / 订单 ID
-       完成同样的核销（复用同一套岗位核销逻辑）。
+三个页面：
+    1. 游客购票：在线支付后生成电子门票二维码，并在提示框中醒目展示
+       取票码（真实订单 ID）；购票后可申请退款；
+    2. 商家核销：人工核销通道。检票员扫码失败时，输入游客提供的取票码，
+       核对后点击确认即可完成一次核销（按门票 → 咖啡 → 越野车的顺序）；
+    3. 运营后台：退款、分账、一键离园结算与园区退款政策配置。
 
-企业级能力：
-    分账 / 退款接口由后端 HMAC-SHA256 签名保护。本文件使用 hmac + hashlib
-    按后端的 canonical string 生成 X-Timestamp / X-Signature，再随 requests
-    请求头发送；否则后端会返回 403。
+资金安全：
+    分账 / 退款 / 离园结算 / 园区配置接口由后端 HMAC-SHA256 签名保护。
+    本文件使用 hmac + hashlib 按后端的 canonical string 生成
+    X-Timestamp / X-Signature，再随 requests 请求头发送；否则返回 403。
 
 签名原文（必须与 main.py 完全一致）：
     {timestamp}\n{METHOD}\n{path}\n{sha256_hex(body)}
@@ -24,7 +22,7 @@
     终端 1：python main.py
     终端 2：python app_scan.py
 
-    两端必须使用相同的 API_SIGNING_SECRET（默认值仅用于本地演示）：
+    两端必须使用相同的 API_SIGNING_SECRET：
         set API_SIGNING_SECRET=your-secret   # Windows CMD
         export API_SIGNING_SECRET=your-secret  # PowerShell / Git Bash
 
@@ -110,7 +108,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
-logger = logging.getLogger("tourism-scan-poc")
+logger = logging.getLogger("tourism-scan")
 
 
 # ===========================================================================
@@ -118,8 +116,8 @@ logger = logging.getLogger("tourism-scan-poc")
 # ===========================================================================
 
 def _generate_order_no() -> str:
-    """生成不超过 32 字符、便于人工识别的 POC 订单号。"""
-    return f"POC{datetime.now():%Y%m%d%H%M%S}{secrets.randbelow(10000):04d}"
+    """生成不超过 32 字符、便于人工识别的业务订单号。"""
+    return f"XC{datetime.now():%Y%m%d%H%M%S}{secrets.randbelow(10000):04d}"
 
 
 def _status_card(kind: str, title: str, body: str = "") -> str:
@@ -195,10 +193,10 @@ def _resolve_target_order_id(
     manual_order_id: Any,
 ) -> tuple[int | None, str]:
     """
-    决定本次退款 / 分账作用于哪张订单：
+    决定本次退款 / 分账 / 结算作用于哪张订单：
 
-    1. 优先使用界面中手动填写的订单 ID（便于测试演示订单）；
-    2. 否则使用最近一次购买产生的订单 ID；
+    1. 优先使用界面中手动填写的订单 ID；
+    2. 否则使用最近一次购票产生的订单 ID；
     3. 都没有时返回提示信息。
     """
     if manual_order_id not in (None, ""):
@@ -221,8 +219,7 @@ def _resolve_target_order_id(
 
     return (
         None,
-        "请先购买门票，或在“订单 ID”输入框中填写要操作的订单"
-        "（演示订单通常为 1）。",
+        "请先购买门票，或在“订单 ID”输入框中填写要操作的订单。",
     )
 
 
@@ -280,6 +277,73 @@ def request_split(last_order: Any, manual_order_id: Any) -> str:
     return _render_financial_response(response, kind="split", path=path)
 
 
+def _render_settlement_markdown(data: dict[str, Any]) -> str:
+    """
+    渲染离园结算结果。
+
+    结算结果 = 过期处理摘要 + 分账明细。重点说明两件事：
+      1. 未核销子项已过期，不能再使用、也不能再退款；
+      2. 过期金额留在平台，已核销金额已按商户抽成分账。
+    """
+    expired_count = data.get("expired_item_count") or 0
+    expired_amount = _money_text(data.get("expired_amount"))
+    exited_at = _local_time_label(data.get("exited_at")) or "刚刚"
+    header = (
+        "## 🚪 离园结算完成\n\n"
+        f"> {_md_cell(data.get('message') or '未使用项目已过期，分账已完成。')}\n\n"
+        "| 结算摘要 | 结果 |\n"
+        "| :--- | :--- |\n"
+        f"| 离园时间 | {_md_cell(exited_at)} |\n"
+        f"| 已过期子项 | {expired_count} 项 |\n"
+        f"| 过期金额（留在平台） | **{expired_amount}** |\n\n"
+    )
+    return header + _render_split_markdown(data)
+
+
+def request_exit_settlement(last_order: Any, manual_order_id: Any) -> str:
+    """
+    运营后台按钮事件：POST /api/order/{id}/exit-settlement。
+
+    一键完成“离园登记 → 未使用子项过期 → 已核销项分账”，
+    用于验证订单不会永久停留在“部分核销”状态。
+    """
+    order_id, hint = _resolve_target_order_id(last_order, manual_order_id)
+    if order_id is None:
+        return _render_request_error("尚未选择订单", hint)
+
+    path = f"/api/order/{order_id}/exit-settlement"
+    try:
+        response = _post_signed(path)
+    except requests.ConnectionError:
+        return _render_request_error(
+            "无法连接后端",
+            f"请确认已启动 python main.py（{API_BASE_URL}）。",
+            path,
+        )
+    except requests.Timeout:
+        return _render_request_error(
+            "请求超时",
+            f"后端在 {REQUEST_TIMEOUT:g} 秒内没有响应。",
+            path,
+        )
+    except requests.RequestException as exc:
+        return _render_request_error("请求异常", str(exc), path)
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+
+    if response.status_code == 200 and isinstance(data, dict):
+        return _render_settlement_markdown(data)
+
+    return _render_request_error(
+        f"离园结算失败（HTTP {response.status_code}）",
+        _response_detail(response) or "后端未返回错误信息。",
+        path,
+    )
+
+
 def load_park_settings() -> tuple[Any, Any, str]:
     path = "/api/park-settings"
     try:
@@ -314,14 +378,24 @@ def load_park_settings() -> tuple[Any, Any, str]:
     hours = int(data.get("refund_window_hours", 72))
     return (
         gr.update(value=allow),
-        gr.update(value=hours),
+        # 配置为“离园后不允许退款”时，退款窗口立即隐藏，避免出现
+        # “既不允许退款、又显示 72 小时窗口”的配置死锁。
+        gr.update(value=hours, visible=allow),
         _status_card(
             "info",
             "园区配置已加载",
-            f"离园后退款：{'允许' if allow else '不允许'} · "
-            f"退款窗口：{hours} 小时",
+            (
+                f"离园后退款：允许 · 退款窗口：{hours} 小时"
+                if allow
+                else "离园后退款：不允许（退款窗口已隐藏，离园后立即不可退）"
+            ),
         ),
     )
+
+
+def toggle_refund_window(allow: Any) -> Any:
+    """园区“离园后仍允许退款”开关联动：关闭时隐藏退款窗口输入框。"""
+    return gr.update(visible=bool(allow))
 
 
 def save_park_settings(allow: Any, hours: Any) -> str:
@@ -362,165 +436,16 @@ def save_park_settings(allow: Any, hours: Any) -> str:
         return _status_card(
             "success",
             "园区配置已保存",
-            f"离园后退款：{'允许' if allow else '不允许'} · "
-            f"退款窗口：{hours_value} 小时",
+            (
+                f"离园后退款：允许 · 退款窗口：{hours_value} 小时"
+                if allow
+                else "离园后退款：不允许（离园或闭园后立即不可退款）"
+            ),
         )
     return _render_request_error(
         f"保存失败（HTTP {response.status_code}）",
         _response_detail(response) or "后端未返回错误信息。",
         path,
-    )
-
-
-def _reset_error(
-    title: str,
-    message: str,
-    path: str = "/api/demo/reset",
-) -> tuple[Any, Any, Any, Any, Any, Any, Any, str]:
-    """重置失败时保持页面其它区域不变，仅展示错误卡片。"""
-    error = _render_request_error(title, message, path)
-    return (
-        error,
-        gr.skip(),  # 二维码
-        gr.skip(),  # 购票成功提示
-        gr.skip(),  # 二维码说明
-        gr.skip(),  # 订单 ID 输入框
-        gr.skip(),  # last_order
-        gr.skip(),  # 订单状态
-        error,      # 运营后台结果区
-    )
-
-
-def reset_demo_environment() -> tuple[Any, Any, str, str, int | None, Any, str, str]:
-    """
-    顶部按钮事件：一键重置演示环境。
-
-    调用签名接口 POST /api/demo/reset，后端会清空历史订单 / 核销记录，
-    并返回一张全新的“已支付 + 三项未核销”订单。前端同时完成：
-
-      1. 绿色成功提示 + 新订单 ID；
-      2. 自动生成新电子门票二维码，可直接去商家端扫码核销；
-      3. 自动切换订单状态 / 退款 / 分账所用的订单 ID。
-    """
-    path = "/api/demo/reset"
-    try:
-        response = _post_signed(path)
-    except requests.ConnectionError:
-        return _reset_error(
-            "无法连接后端",
-            f"请确认已启动 python main.py（{API_BASE_URL}）。",
-            path,
-        )
-    except requests.Timeout:
-        return _reset_error(
-            "请求超时",
-            f"后端在 {REQUEST_TIMEOUT:g} 秒内没有响应。",
-            path,
-        )
-    except requests.RequestException as exc:
-        return _reset_error("请求异常", str(exc), path)
-
-    try:
-        data = response.json()
-    except ValueError:
-        data = None
-
-    if response.status_code != 200 or not isinstance(data, dict):
-        detail = data.get("detail") if isinstance(data, dict) else None
-        if response.status_code == 403:
-            message = (
-                "签名验证失败：请确认 app_scan.py 与 main.py 使用相同的 "
-                "API_SIGNING_SECRET，并检查本机时间是否准确。"
-            )
-        elif isinstance(detail, str) and detail:
-            message = detail
-        else:
-            message = (response.text or "").strip()[:500] or "后端未返回响应内容。"
-        return _reset_error(
-            f"重置失败（HTTP {response.status_code}）",
-            message,
-            path,
-        )
-
-    if not data.get("order_id"):
-        return _reset_error("重置失败", "后端响应缺少新订单 ID。", path)
-
-    order_id = int(data["order_id"])
-    order_no = str(data.get("order_no") or "")
-
-    # 优先使用后端返回的门票核销记录 ID；缺失时从 items 中兜底查找。
-    ticket_record_id: int | None = None
-    raw_ticket_id = data.get("ticket_record_id")
-    if isinstance(raw_ticket_id, int) and raw_ticket_id > 0:
-        ticket_record_id = raw_ticket_id
-    else:
-        for item in data.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            if "门票" not in str(item.get("item_name") or ""):
-                continue
-            try:
-                ticket_record_id = int(item.get("verify_record_id"))
-            except (TypeError, ValueError):
-                ticket_record_id = None
-            break
-
-    qr_update: Any = gr.skip()
-    if ticket_record_id is not None:
-        try:
-            qr_update = gr.update(
-                value=_make_qr_image(f"{CODE_PREFIX}{ticket_record_id:04d}"),
-                visible=True,
-            )
-        except Exception:  # noqa: BLE001 - 二维码失败不应阻断重置结果展示
-            logger.exception("重置后生成二维码失败")
-
-    order_state = {
-        "order_id": order_id,
-        "order_no": order_no,
-        "record_id": ticket_record_id,
-        "source": "一键重置演示环境",
-    }
-
-    # Gradio toast 会 print 到控制台，Windows GBK 终端无法编码 emoji；
-    # 因此 toast 使用纯文本，绿色 ✅ 卡片由下面的 HTML 提示展示。
-    message = f"演示环境已重置，请使用新订单 ID：{order_id} 开始测试！"
-    gr.Success(message, title="演示环境已重置")
-
-    reset_html = _status_card(
-        "success",
-        "演示环境已重置",
-        f"新订单 ID：<b>{order_id}</b> · 订单号：{html.escape(order_no)}<br>"
-        "门票 / 咖啡 / 越野车三项均为未核销，可直接开始测试。",
-    )
-    success_html = (
-        '<div class="purchase-success" role="status">'
-        '<div class="purchase-success-icon">✅</div>'
-        '<div class="purchase-success-text">'
-        '<div class="purchase-success-title">'
-        "演示环境已重置！新的电子门票已生成，请先核销门票。"
-        "</div>"
-        '<div class="purchase-success-meta">'
-        f"订单号：{html.escape(order_no)} · 门票核销后，咖啡与越野车项目才会开放"
-        "</div></div></div>"
-    )
-    action_md = (
-        f"### ✅ 新订单已就绪\n"
-        f"已自动切换到订单 `#{order_id}`（{_md_cell(order_no)}）。\n\n"
-        "门票、咖啡、越野车均为未核销。可先核销部分项目，"
-        "再点击「💸 申请退款」验证“部分退款”，随后点击「📊 执行分账」，"
-        "查看已核销项目如何单独抽成结算。"
-    )
-
-    return (
-        reset_html,
-        qr_update,
-        success_html,
-        _QR_NOTE_HTML,
-        order_id,
-        order_state,
-        _render_order_status(order_state),
-        action_md,
     )
 
 
@@ -563,6 +488,7 @@ def _verify_status_label(value: Any) -> str:
         "unverified": "未核销 ⏳",
         "verified": "已核销 ✅",
         "refunded": "已退款 💸",
+        "expired": "已过期 ⌛",
     }
     return labels.get(str(value), str(value))
 
@@ -615,10 +541,19 @@ def _render_split_markdown(data: dict[str, Any]) -> str:
     """
     items = data.get("items") or []
     excluded_items = [
-        item for item in items if not item.get("split_eligible", True)
+        item
+        for item in items
+        if not item.get("split_eligible", True)
+        and item.get("verify_status") != "expired"
+    ]
+    expired_items = [
+        item for item in items if item.get("verify_status") == "expired"
     ]
     excluded_names = "、".join(
         _md_cell(item.get("item_name")) for item in excluded_items
+    )
+    expired_names = "、".join(
+        _md_cell(item.get("item_name")) for item in expired_items
     )
 
     lines: list[str] = [
@@ -628,17 +563,21 @@ def _render_split_markdown(data: dict[str, Any]) -> str:
         f"**订单 ID**：`{_md_cell(data.get('order_id'))}`　"
         f"**状态**：{_order_status_label(data.get('order_status'))}",
         "",
-        "> 分账规则：仅“已核销”子项进入分账池；未核销 / 已退款子项"
-        "不抽成、不结算，金额记 0 元。",
+        "> 分账规则：已核销子项进入分账池，按商户抽成后结算；"
+        "未核销 / 已退款子项不结算，金额记 0 元；"
+        "离园结算后已过期的子项金额全额留在平台。",
         "",
         "| 汇总 | 金额 |",
         "| :--- | ---: |",
         f"| 订单总额 | {_money_text(data.get('total_amount'))} |",
         f"| **分账基数（已核销项）** | **{_money_text(data.get('split_amount'))}** |",
-        f"| 平台留存 | **{_money_text(data.get('platform_retention'))}** |",
+        f"| 过期留存平台（未使用） | {_money_text(data.get('forfeited_amount'))} |",
+        f"| 平台留存合计 | **{_money_text(data.get('platform_retention'))}** |",
         f"| 商户实得合计 | **{_money_text(data.get('merchant_income_total'))}** |",
     ]
 
+    if expired_names:
+        lines.append(f"| 已过期留给平台 | {expired_names} |")
     if excluded_names:
         lines.append(
             f"| 未参与分账项目 | {excluded_names}（记 0 元） |"
@@ -677,11 +616,17 @@ def _render_split_markdown(data: dict[str, Any]) -> str:
     ]
     for item in items:
         eligible = bool(item.get("split_eligible", True))
+        if eligible:
+            eligible_text = "✅ 是"
+        elif item.get("verify_status") == "expired":
+            eligible_text = "⌛ 平台留存"
+        else:
+            eligible_text = "— 否（记 0）"
         lines.append(
             f"| {_md_cell(item.get('item_name'))} "
             f"| {_md_cell(item.get('merchant_name'))} "
             f"| {_verify_status_label(item.get('verify_status'))} "
-            f"| {'✅ 是' if eligible else '— 否（记 0）'} "
+            f"| {eligible_text} "
             f"| {_money_text(item.get('amount'))} "
             f"| {_money_text(item.get('platform_commission'))} "
             f"| **{_money_text(item.get('merchant_income'))}** |"
@@ -841,7 +786,7 @@ def _render_financial_response(
 
 
 # ===========================================================================
-# 五、购票：二维码 + 测试订单
+# 五、购票：订单落库 + 电子门票二维码
 # ===========================================================================
 
 @dataclass
@@ -1026,7 +971,7 @@ _local_db_lock = threading.Lock()
 
 def _ensure_local_db() -> None:
     """
-    确保 main.py 的 ORM 表已创建，并且演示商户数据存在。
+    确保 main.py 的 ORM 表已创建，并且基础商户数据存在。
 
     app_scan.py 可能先于 main.py 启动，所以这里做一次幂等初始化。
     """
@@ -1049,7 +994,7 @@ def _ensure_local_db() -> None:
 
 def _create_order_local(order_no: str) -> tuple[str, int, int]:
     """
-    使用 SQLAlchemy 直接写入一条测试订单和三条未核销记录。
+    使用 SQLAlchemy 直接写入一条已支付订单和三条未核销记录。
 
     200 元套餐拆成“门票 80 + 咖啡 40 + 越野车 80”三个子项，三者由不同商户
     分别核销：景区检票员先核销门票，之后咖啡店员 / 越野车安全员才能核销对应项目。
@@ -1154,7 +1099,7 @@ def _create_order_local(order_no: str) -> tuple[str, int, int]:
     raise last_error or RuntimeError("本地创建订单失败")
 
 
-def _create_test_order() -> OrderCreation:
+def _create_purchase_order() -> OrderCreation:
     """优先走后端 POST，失败后自动使用本地 SQLAlchemy 兜底。"""
     order_no = _generate_order_no()
 
@@ -1173,8 +1118,8 @@ def _create_test_order() -> OrderCreation:
             note=f"{api_note}；已自动改用本地数据库写入。",
             order_id=order_id,
         )
-    except Exception as exc:  # noqa: BLE001 - POC 需要把具体原因展示给用户
-        logger.exception("本地创建测试订单失败")
+    except Exception as exc:  # noqa: BLE001 - 需要把具体原因展示给用户
+        logger.exception("本地创建订单失败")
         return OrderCreation(
             order_no=order_no,
             record_id=DEFAULT_VERIFY_RECORD_ID,
@@ -1247,6 +1192,10 @@ def _status_item_html(
         badge_class = "status-badge-refunded"
         item_class = " is-refunded"
         text = "已退款"
+    elif verify_status == "expired":
+        badge_class = "status-badge-expired"
+        item_class = " is-expired"
+        text = "已过期"
     else:
         badge_class = "status-badge-pending"
         item_class = ""
@@ -1427,7 +1376,9 @@ def _render_order_status(state: Any) -> str:
         if item is not None
     ]
 
-    if ticket is not None and ticket_status == "refunded":
+    if ticket is not None and ticket_status == "expired":
+        tip = "门票已过期，本次游园已结束；如需游玩请重新购票。"
+    elif ticket is not None and ticket_status == "refunded":
         tip = "门票已退款，无法继续使用；如仍需游玩请在游客端重新购票。"
     elif ticket is not None and not ticket_done:
         tip = "请先到检票口完成门票核销；门票核销后，咖啡和越野车项目才会开放。"
@@ -1438,14 +1389,24 @@ def _render_order_status(state: Any) -> str:
         refunded_labels = [
             label for label, _item, status in included_items if status == "refunded"
         ]
+        expired_labels = [
+            label for label, _item, status in included_items if status == "expired"
+        ]
         if pending_labels:
             prefix = "门票已核销，" if ticket_done else ""
             tip = (
                 f"{prefix}请保留这张二维码前往"
                 f"{'、'.join(pending_labels)}项目完成剩余核销。"
             )
+            if expired_labels:
+                tip += f"（{'、'.join(expired_labels)}已过期，无法使用）"
             if refunded_labels:
                 tip += f"（{'、'.join(refunded_labels)}已退款，无需核销）"
+        elif expired_labels:
+            tip = (
+                f"本次游园已结束，未使用项目（{'、'.join(expired_labels)}）"
+                "已过期；如需游玩请重新购票。"
+            )
         elif refunded_labels:
             tip = (
                 f"订单未核销项目（{'、'.join(refunded_labels)}）已退款，"
@@ -1492,10 +1453,11 @@ _QR_NOTE_HTML = (
     '<div class="qr-note">'
     '<div class="qr-note-title">📲 核销说明</div>'
     "<p><strong>【门票】</strong>、<strong>【咖啡】</strong>与"
-    "<strong>【越野车】</strong>需分别扫码核销。"
+    "<strong>【越野车】</strong>需分别核销。"
     "请先在检票口核销门票，之后才能前往咖啡馆和越野车体验区；"
     "每次核销后请妥善保留此码。</p>"
-    "<p>离园时请在景区出口扫码登记；再次入园需重新购票。</p>"
+    "<p>如遇扫码失败，请向工作人员提供取票码完成人工核销；"
+    "离园后未使用的项目将自动失效。</p>"
     "</div>"
 )
 
@@ -1510,7 +1472,7 @@ _QR_PLACEHOLDER = (
 _QR_SCAN_TIP_HTML = (
     '<div class="qr-scan-tip" role="note">'
     '<span class="qr-scan-tip-icon">📷</span>'
-    "请到商家核销处出示二维码；门票核销后，咖啡与越野车项目才会开放"
+    "请到商家核销处出示二维码或取票码；门票核销后，咖啡与越野车项目才会开放"
     "</div>"
 )
 
@@ -1522,7 +1484,7 @@ def purchase() -> tuple[Any, str, str, int | None, dict[str, Any], str]:
     返回：二维码更新（成功后 visible=True，失败时保持隐藏）、购票成功提示、
     二维码下方说明、订单 ID、会话状态、订单状态卡片。
     """
-    creation = _create_test_order()
+    creation = _create_purchase_order()
     code = f"{CODE_PREFIX}{creation.record_id:04d}"
 
     try:
@@ -1560,6 +1522,19 @@ def purchase() -> tuple[Any, str, str, int | None, dict[str, Any], str]:
             _render_order_status(order_state),
         )
 
+    # 取票码 = 真实订单 ID。大字展示，方便游客记录，也方便检票员
+    # 在扫码失败时走“人工核销通道”补录。
+    pickup_code_html = ""
+    if creation.order_id is not None:
+        pickup_code_html = (
+            '<div class="pickup-code" role="note">'
+            '<div class="pickup-code-label">请记录您的取票码</div>'
+            f'<div class="pickup-code-value">{int(creation.order_id)}</div>'
+            '<div class="pickup-code-hint">'
+            "扫码失败时，可向检票员报出此取票码完成人工核销"
+            "</div></div>"
+        )
+
     success_html = (
         '<div class="purchase-success" role="status">'
         '<div class="purchase-success-icon">✅</div>'
@@ -1570,6 +1545,7 @@ def purchase() -> tuple[Any, str, str, int | None, dict[str, Any], str]:
         '<div class="purchase-success-meta">'
         f"订单号：{html.escape(creation.order_no)} · {html.escape(PRODUCT_NAME)}"
         "</div></div></div>"
+        f"{pickup_code_html}"
     )
 
     gr.Info("购票成功！请向景区检票员出示二维码", title="购票成功")
@@ -1758,62 +1734,6 @@ def decode_qr(image: Any) -> str | None:
 # 七、核销
 # ===========================================================================
 
-def _record_exists_local(record_id: int) -> bool:
-    """查询本地 SQLite，判断二维码里的记录 ID 是否真实存在。"""
-    if not DB_PATH.exists():
-        return False
-
-    try:
-        connection = sqlite3.connect(str(DB_PATH), timeout=2)
-        try:
-            row = connection.execute(
-                "SELECT 1 FROM verify_records WHERE id = ? LIMIT 1",
-                (record_id,),
-            ).fetchone()
-            return row is not None
-        finally:
-            connection.close()
-    except sqlite3.Error:
-        logger.warning("查询本地核销记录失败：record_id=%s", record_id, exc_info=True)
-        return False
-
-
-def _lookup_order_items(order_id: int) -> list[dict[str, Any]] | None:
-    """读取本地库中某订单的全部核销项；订单不存在或读取失败返回 None。"""
-    if not DB_PATH.exists():
-        return None
-
-    try:
-        connection = sqlite3.connect(
-            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
-        )
-        try:
-            rows = connection.execute(
-                "SELECT id, item_name, verify_status FROM verify_records "
-                "WHERE order_id = ? ORDER BY id",
-                (order_id,),
-            ).fetchall()
-        finally:
-            connection.close()
-    except sqlite3.Error:
-        logger.warning(
-            "按订单查询核销项失败：order_id=%s", order_id, exc_info=True
-        )
-        return None
-
-    if not rows:
-        return None
-
-    return [
-        {
-            "id": int(item[0]),
-            "item_name": str(item[1] or ""),
-            "verify_status": str(item[2] or ""),
-        }
-        for item in rows
-    ]
-
-
 def _post_config(post_label: Any) -> dict[str, str]:
     label = str(post_label or "").strip()
     return SCAN_POSTS.get(label, SCAN_POSTS[DEFAULT_VERIFY_POST])
@@ -1934,6 +1854,76 @@ def _submit_exit_request(
     )
 
 
+def _verify_conflict_result(
+    detail_text: str,
+    post_name: str,
+) -> tuple[str, str]:
+    """
+    把核销接口的 409 映射为准确的现场提示。
+
+    409 既可能是重复核销，也可能是闭园、游园已结束、票已退款或订单
+    状态不允许核销。不能一律显示“已核销”，否则会与“门票未核销”的
+    提示互相矛盾，误导现场人员以为数据串单。
+    """
+    reason = detail_text or "当前订单不允许核销"
+
+    if "门票未核销" in reason:
+        return _verification_result(
+            "warning",
+            "门票未核销，请先去检票口",
+            "游客尚未完成门票核销。请先到检票口由景区检票员核销门票，"
+            "再回来兑换。",
+            "⚠️ 门票未核销，请先去检票口",
+        )
+
+    if "已核销" in reason:
+        return _verification_result(
+            "error",
+            "该票已核销，请勿重复扫码！",
+            f"{html.escape(reason)}<br>当前岗位：{html.escape(post_name)}",
+            "❌ 该票已核销，请勿重复扫码！",
+        )
+
+    if "不匹配" in reason:
+        return _verification_result(
+            "error",
+            "票号与订单不匹配",
+            html.escape(reason),
+            "❌ 票号与订单不匹配，请使用当前订单的二维码",
+        )
+
+    if "退款" in reason:
+        return _verification_result(
+            "warning",
+            "该票已退款，不可核销",
+            html.escape(reason),
+            "⚠️ 该票已退款，不可核销",
+        )
+
+    if "闭园" in reason:
+        return _verification_result(
+            "warning",
+            "景区已闭园，今日无法核销",
+            html.escape(reason),
+            "⚠️ 景区已闭园，今日无法检票入园",
+        )
+
+    if "游园已结束" in reason or "重新购票" in reason:
+        return _verification_result(
+            "warning",
+            "本次游园已结束",
+            html.escape(reason),
+            "⚠️ 本次游园已结束，请重新购票",
+        )
+
+    return _verification_result(
+        "error",
+        "当前订单暂不可核销",
+        html.escape(reason),
+        "❌ 当前订单暂不可核销，请查看提示",
+    )
+
+
 def _submit_verify_request(
     seed_record_id: int,
     post_label: Any,
@@ -1941,7 +1931,7 @@ def _submit_verify_request(
     origin: str = "",
 ) -> tuple[str, str]:
     """
-    调用后端岗位核销接口（摄像头扫码与备用演示区共用）。
+    调用后端岗位核销接口（摄像头扫码通道）。
 
     seed_record_id 可以是订单内任意一条核销记录（二维码里通常是门票记录）；
     后端根据 post 只核销当前岗位负责的子项，不再按顺序自动核销下一项。
@@ -2016,20 +2006,7 @@ def _submit_verify_request(
     detail_text = _response_detail(response)
 
     if response.status_code == 409:
-        if "门票未核销" in detail_text:
-            return _verification_result(
-                "warning",
-                "门票未核销，请先去检票口",
-                "游客尚未完成门票核销。请先到检票口由景区检票员核销门票，再回来兑换。",
-                "⚠️ 门票未核销，请先去检票口",
-            )
-
-        return _verification_result(
-            "error",
-            "该票已核销，请勿重复扫码！",
-            f"当前岗位（{html.escape(post_name)}）负责的项目已经核销过，请勿重复扫码。",
-            "❌ 该票已核销，请勿重复扫码！",
-        )
+        return _verify_conflict_result(detail_text, post_name)
 
     if response.status_code == 404:
         if "不含" in detail_text:
@@ -2054,50 +2031,196 @@ def _submit_verify_request(
     )
 
 
-def _resolve_manual_seed_record_id(raw_input: Any) -> tuple[int | None, str]:
-    """
-    解析备用演示区的手动输入，返回订单内任意一条核销记录 ID。
+def _fetch_order_payload(order_id: int) -> dict[str, Any] | None:
+    """读取订单详情（含全部核销子项）；失败时返回 None。"""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/api/orders/{int(order_id)}",
+            timeout=REQUEST_TIMEOUT,
+        )
+    except (requests.RequestException, TypeError, ValueError):
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
-    岗位核销只需要知道“这是哪张订单”，因此这里返回的 ID 仅作为定位种子：
-      - 电子票号：TK-8（与摄像头扫描的二维码内容一致）；
-      - 订单 ID：8（取该订单的第一条核销记录）；
-      - 兼容纯数字写法的核销记录号（该数字不存在对应订单时）。
+
+def _parse_pickup_code(raw_input: Any) -> tuple[int | None, str]:
+    """
+    解析游客提供的取票码。
+
+    取票码就是真实订单 ID（游客购票成功后大字展示的那个数字）。
+    为防止把二维码里的电子票号（TK-xxxx）误当成订单 ID，这里只接受纯数字。
     """
     text = str(raw_input or "").strip()
     if not text:
-        return None, "请输入电子票号或订单 ID。"
+        return None, "请输入游客提供的取票码。"
+    if not re.fullmatch(r"\d{1,9}", text):
+        return None, "取票码格式不正确，请核对游客出示的号码后重新输入。"
+    return int(text), ""
 
-    match = CODE_PATTERN.fullmatch(text.upper())
-    if match is not None:
-        return int(match.group(1)), ""
 
-    if re.fullmatch(r"\d{1,9}", text):
-        numeric = int(text)
-        items = _lookup_order_items(numeric)
-        if items:
-            return int(items[0]["id"]), ""
-        if _record_exists_local(numeric):
-            return numeric, ""
-        return None, f"未找到订单或电子票：{text}，请核对后再试。"
+def _pick_next_pending_record(
+    records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """按门票 → 咖啡 → 越野车的业务顺序，选出下一个待核销子项。"""
+    pending = [
+        record
+        for record in records
+        if str(record.get("verify_status") or "") == "unverified"
+    ]
+    for keyword in (TICKET_ITEM_NAME, COFFEE_ITEM_NAME, OFFROAD_ITEM_NAME):
+        for record in pending:
+            if keyword in str(record.get("item_name") or ""):
+                return record
+    return pending[0] if pending else None
 
-    return None, (
-        "票号格式不正确：电子票号请以 TK- 开头（如 TK-8），"
-        "也可直接输入订单 ID。"
+
+def manual_verify_by_pickup_code(pickup_code: Any, post_label: Any) -> tuple[str, str]:
+    """
+    人工核销通道：检票员扫码失败后，输入游客取票码完成补录。
+    严格按照当前所选岗位进行核销（游客走到哪核哪）。
+    """
+    order_id, parse_error = _parse_pickup_code(pickup_code)
+    if order_id is None:
+        return (
+            _status_card("warning", "请核对取票码", html.escape(parse_error)),
+            gr.update(),
+        )
+
+    # 解析岗位
+    config = _post_config(post_label)
+    if config["key"] == "exit":
+        return _submit_exit_request(order_id, origin="人工通道离园")
+    
+    post_key = config["key"]
+    post_name = str(post_label or DEFAULT_VERIFY_POST)
+
+    order = _fetch_order_payload(order_id)
+    if order is None:
+        return _verification_result(
+            "error", "未找到该取票码",
+            f"未查询到取票码 <b>{order_id}</b> 对应的订单，请核对后重试。",
+            "❌ 未找到该取票码，请核对后重试",
+        )
+
+    records = [
+        record for record in (order.get("verify_records") or []) if isinstance(record, dict)
+    ]
+    
+    # 🚨 核心逻辑：根据岗位精准匹配，不再自动按顺序
+    target = None
+    for record in records:
+        if config["item"] in str(record.get("item_name") or ""):
+            target = record
+            break
+
+    if target is None:
+        return _verification_result(
+            "error", "订单不含该项目",
+            f"该订单中找不到「{config['item']}」项目，请核对订单内容。",
+            f"❌ 该订单不含「{config['item']}」",
+        )
+
+    # 直接读取状态，如果已经核销/退款/过期，直接给出提示
+    if target.get("verify_status") != "unverified":
+         status = target.get("verify_status")
+         msg = {"verified": "已核销", "refunded": "已退款", "expired": "已过期"}.get(status, status)
+         return _verification_result(
+            "warning", "无法核销",
+            f"该「{config['item']}」项目状态为：{msg}，不可重复操作。",
+            f"⚠️ 该项目{msg}，不可再核销",
+        )
+
+    try:
+        record_id = int(target.get("id"))
+    except (TypeError, ValueError):
+        return _verification_result("error", "订单数据异常", "核销子项缺少有效编号。", "❌ 订单数据异常")
+
+    verify_url = f"{API_BASE_URL}/api/verify-records/{record_id}/verify"
+    
+    # 调用接口时，必须带上 post_key，让后端再次校验（比如没核门票就不能核咖啡）
+    logger.info(
+        "人工核销：order_id=%s, record_id=%s, item=%s, post=%s",
+        order_id, record_id, target.get("item_name"), post_key
     )
+    try:
+        response = requests.post(
+            verify_url,
+            params={"order_id": order_id, "post": post_key},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.ConnectionError:
+        return _verification_result(
+            "error",
+            "核销失败",
+            f"无法连接后端（{html.escape(API_BASE_URL)}），请联系现场技术人员。",
+            "❌ 核销失败，请检查网络后重试",
+        )
+    except requests.Timeout:
+        return _verification_result(
+            "error",
+            "核销失败",
+            f"后端在 {REQUEST_TIMEOUT:g} 秒内没有响应，请稍后重试。",
+            "❌ 核销失败，请稍后重试",
+        )
+    except requests.RequestException:
+        return _verification_result(
+            "error", "核销失败", "核销请求异常，请稍后重试。",
+            "❌ 核销失败，请稍后重试",
+        )
 
+    if response.status_code == 200:
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        item_name = (
+            str(body.get("item_name") or target.get("item_name") or "项目")
+            if isinstance(body, dict)
+            else str(target.get("item_name") or "项目")
+        )
 
-def simulate_verify(
-    raw_input: Any,
-    post_label: Any = DEFAULT_VERIFY_POST,
-) -> tuple[str, Any]:
-    """备用演示区：跳过摄像头，按当前岗位核销输入框里的票号。"""
-    seed_record_id, message = _resolve_manual_seed_record_id(raw_input)
-    if seed_record_id is None:
-        return _status_card("warning", "请核对票号", message), gr.update()
-    return _submit_verify_request(
-        seed_record_id,
-        post_label,
-        origin="备用演示区（模拟扫码）",
+        refreshed = _fetch_order_payload(order_id) or {}
+        remaining = [
+            record
+            for record in (refreshed.get("verify_records") or [])
+            if isinstance(record, dict)
+            and str(record.get("verify_status") or "") == "unverified"
+        ]
+        remaining_text = (
+            "全部项目已核销，祝游客游玩愉快！"
+            if not remaining
+            else f"剩余未核销项目：{len(remaining)} 项"
+        )
+        return _verification_result(
+            "success",
+            f"{item_name}核销成功",
+            (
+                f"取票码：<b>{order_id}</b><br>"
+                f"本次核销项目：<b>{html.escape(item_name)}</b><br>"
+                f"{html.escape(remaining_text)}"
+            ),
+            f"✅ {item_name}核销成功",
+        )
+
+    detail_text = _response_detail(response)
+    if response.status_code == 409:
+        return _verify_conflict_result(detail_text, post_name)
+    if response.status_code == 404:
+        return _verification_result(
+            "error",
+            "未找到该取票码",
+            "请核对游客提供的取票码，或到售票处核验订单。",
+            "❌ 未找到该取票码，请核对后重试",
+        )
+    return _verification_result(
+        "error", "核销失败", "核销系统暂时不可用，请稍后重试。",
+        "❌ 核销失败，请稍后重试",
     )
 
 
@@ -2235,20 +2358,6 @@ footer,
 }
 .scan-panel {
     padding: 6px 4px;
-}
-/* 备用演示区：与摄像头扫码区分隔，输入框与按钮底部对齐。 */
-.backup-divider {
-    margin: 22px 0 4px;
-    border-top: 1px dashed #cbd5e1;
-}
-.backup-row {
-    align-items: flex-end !important;
-}
-.backup-hint {
-    margin-top: 2px;
-    color: #64748b;
-    font-size: 0.85rem;
-    line-height: 1.5;
 }
 .tourist-panel {
     padding: 8px 6px;
@@ -2503,6 +2612,43 @@ footer,
     font-size: 0.82rem;
     opacity: 0.85;
 }
+/* 取票码：购票成功后大字展示，保证游客能一眼记录、检票员能人工补录 */
+.pickup-code {
+    margin: 4px 0 12px;
+    padding: 20px 24px;
+    border-radius: 20px;
+    background: linear-gradient(135deg, #065f46, #047857);
+    color: #ffffff;
+    text-align: center;
+    box-shadow: 0 16px 34px rgba(4, 120, 87, 0.28);
+}
+.pickup-code-label {
+    font-size: 1rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    opacity: 0.92;
+}
+.pickup-code-value {
+    margin: 8px 0 6px;
+    font-size: 3.1rem;
+    font-weight: 900;
+    line-height: 1.1;
+    letter-spacing: 0.12em;
+    font-variant-numeric: tabular-nums;
+}
+.pickup-code-hint {
+    font-size: 0.86rem;
+    opacity: 0.88;
+}
+/* 人工核销通道：输入框与确认按钮底部对齐 */
+.manual-verify-row {
+    align-items: flex-end !important;
+    gap: 12px !important;
+}
+.manual-verify-panel {
+    max-width: 760px;
+    margin: 0 auto;
+}
 .qr-image-box {
     border-radius: 22px !important;
     overflow: hidden;
@@ -2623,6 +2769,11 @@ footer,
     background: #fef2f2;
     border-color: #fca5a5;
 }
+.status-item.is-expired {
+    background: #f1f5f9;
+    border-color: #cbd5e1;
+    opacity: 0.85;
+}
 .status-icon {
     font-size: 1.65rem;
     line-height: 1;
@@ -2654,6 +2805,11 @@ footer,
     background: #fee2e2;
     color: #b91c1c;
     border: 1px solid #fca5a5;
+}
+.status-badge-expired {
+    background: #e2e8f0;
+    color: #475569;
+    border: 1px solid #cbd5e1;
 }
 .status-tip {
     margin: 13px 0 0;
@@ -2891,8 +3047,8 @@ _PRODUCT_CARD_HTML = """
     <ul class="product-rules">
         <li>购买后立即生效，一码畅玩三项</li>
         <li>门票须最先核销，咖啡 / 越野车随后开放</li>
-        <li>未核销项目均可退款，统一扣 10% 手续费</li>
-        <li>已核销项目退款 0 元；全部已核销则不可退款</li>
+        <li>未核销项目按园区退款规则退还，统一扣 10% 手续费</li>
+        <li>离园后是否可退以园区规则为准；已核销项目退款 0 元</li>
     </ul>
 
     <div class="product-price">
@@ -2906,7 +3062,7 @@ _PRODUCT_CARD_HTML = """
 _BUY_ASSURANCE_HTML = (
     '<div class="buy-assurance">'
     "<span>✅ 支付后立即出票</span>"
-    "<span>↩️ 未核销可随时退款</span>"
+    "<span>↩️ 未核销按园区规则可退</span>"
     "<span>📱 无需取纸质票</span>"
     "</div>"
 )
@@ -2927,24 +3083,18 @@ _HOWTO_HTML = (
 
 _SCAN_PLACEHOLDER = _status_card(
     "info",
-    "等待扫码",
-    "请让游客将二维码对准摄像头，系统会自动识别并立即核销。",
+    "等待核销",
+    "请输入游客提供的取票码，核对订单后进行人工核销。",
 )
 _ACTION_PLACEHOLDER = (
     "### 🧾 订单服务\n"
-    "购票后点击「申请退款」或「执行分账」，"
-    "后端返回的手续费、实退金额和逐项明细会以 Markdown 展示在这里。"
-)
-_RESET_PLACEHOLDER = _status_card(
-    "info",
-    "演示环境就绪",
-    "点击「🔄 重置演示环境」可清空历史数据，并生成一张全新的"
-    "“已支付、门票/咖啡/越野车均未核销”测试订单。",
+    "选择订单后点击「申请退款」「执行分账」或「一键离园结算」，"
+    "处理结果会以明细表展示在这里。"
 )
 
 
 # 现场提示音：每次全屏反馈渲染时，按成功 / 失败 / 警告播放不同音调。
-# 浏览器要求音频上下文先由用户手势解锁；现场点击摄像头即会完成解锁。
+# 浏览器要求音频上下文先由用户手势解锁；检票员点击「确认核销」即会完成解锁。
 _VERIFY_FEEDBACK_JS = r"""
 const getAudioContext = () => {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -3015,36 +3165,12 @@ if hasattr(gr, "WebcamOptions"):
 with gr.Blocks(title="乡村文旅电子门票") as demo:
     gr.HTML(_HERO_HTML, padding=False, container=False)
 
-    # 保存最近一次购票结果，供订单状态 / 退款 / 分账使用（按浏览器会话隔离）。
+    # 保存最近一次购票结果，供订单状态 / 退款 / 分账 / 结算使用
+    # （按浏览器会话隔离）。
     last_order = gr.State(value=None)
-    # 摄像头流式识别状态：记录镜头中已处理的二维码、岗位和停留时间，
-    # 避免同一张二维码每一帧都重复调用核销接口。
-    scan_state = gr.State(value={"code": "", "post": "", "seen_at": 0.0, "idle": False})
 
     # 订单状态每 6 秒自动刷新一次：商家核销后，游客无需手动操作即可看到变化。
     status_timer = gr.Timer(value=6, active=True)
-
-    # -----------------------------------------------------------------------
-    # 页面最显眼位置：一键重置演示环境（对所有 Tab 可见）
-    # -----------------------------------------------------------------------
-    with gr.Row(elem_classes="reset-demo-row"):
-        with gr.Column(scale=5):
-            gr.Markdown(
-                "### 🔄 演示前准备\n"
-                "一键清空历史订单 / 核销记录 / 分账流水，"
-                "并自动生成一张包含门票、咖啡、越野车的全新测试订单。"
-            )
-        reset_button = gr.Button(
-            "🔄 重置演示环境",
-            variant="stop",
-            size="lg",
-            scale=1,
-        )
-    reset_result = gr.HTML(
-        value=_RESET_PLACEHOLDER,
-        padding=False,
-        container=False,
-    )
 
     with gr.Tabs():
         # -------------------------------------------------------------------
@@ -3113,93 +3239,63 @@ with gr.Blocks(title="乡村文旅电子门票") as demo:
                     gr.HTML(_QR_SCAN_TIP_HTML, padding=False, container=False)
 
         # -------------------------------------------------------------------
-        # Tab 2：商家端
+        # Tab 2：商家端 —— 人工核销通道
         # -------------------------------------------------------------------
-        with gr.Tab("📷 商家核销"):
+        with gr.Tab("✅ 商家核销"):
+            gr.Markdown("### 请选择核销通道（扫码自动 / 人工补录）")
+            
+            # === 通道 1：摄像头自动扫码核销 ===
             with gr.Column(elem_classes="scan-panel"):
-                gr.Markdown(
-                    "### 扫描游客门票\n"
-                    "**先选择当前核销岗位**，再让游客把二维码对准摄像头。\n\n"
-                    "识别到二维码的瞬间系统会自动核销，无需点击任何按钮。\n\n"
-                    "· 景区检票员：只核销门票\n\n"
-                    "· 咖啡店员：只核销精品咖啡（须先完成门票核销）\n\n"
-                    "· 越野车安全员：只核销越野车体验（须先完成门票核销）\n\n"
-                    "· 景区出口：登记离园；离园后按园区配置决定未核销项目是否还能退款\n\n"
-                    "> 首次使用如未出现画面，请点击摄像头区域并允许浏览器使用摄像头。"
-                )
-                verify_post = gr.Dropdown(
-                    choices=list(SCAN_POSTS.keys()),
-                    value=DEFAULT_VERIFY_POST,
-                    label="当前核销岗位",
-                    info="系统只处理该岗位对应的项目，不会按顺序自动处理下一项",
-                    interactive=True,
-                    scale=1,
-                    min_width=260,
-                )
-                camera = gr.Image(
-                    sources=["webcam"],
-                    type="numpy",
-                    label="对准游客的二维码（自动识别，无需点击扫描）",
-                    height=600,
-                    interactive=True,
-                    streaming=True,
-                    **_IMAGE_KWARGS,
-                )
+                gr.Markdown("#### 📷 通道一：摄像头扫码（自动化）")
+                with gr.Row():
+                    # 注意：这里定义了扫码头
+                    webcam = gr.Image(
+                        sources=["webcam"], 
+                        type="numpy", 
+                        label="请将二维码对准摄像头",
+                        height=300,
+                        **(_IMAGE_KWARGS if '_IMAGE_KWARGS' in globals() else {})
+                    )
+                    # 核销岗位选择（门票/咖啡/越野车）
+                    post_selector = gr.Dropdown(
+                        choices=list(SCAN_POSTS.keys()),
+                        value=DEFAULT_VERIFY_POST,
+                        label="当前核销岗位",
+                        interactive=True
+                    )
+                
                 scan_status = gr.HTML(value=_SCAN_PLACEHOLDER)
-                # 全屏现场反馈层：绿色对号 / 红色叉号 + 提示音。
+                # 全屏现场反馈层
                 verify_feedback = gr.HTML(
-                    value="",
-                    container=False,
-                    padding=False,
-                    apply_default_css=False,
-                    js_on_load=_VERIFY_FEEDBACK_JS,
+                    value="", container=False, padding=False,
+                    apply_default_css=False, js_on_load=_VERIFY_FEEDBACK_JS,
                     elem_id="verify-feedback",
                 )
 
-                # ---------------- 备用演示区 ----------------
-                # 现场演示时光线可能影响摄像头识别，这里提供不经过摄像头的
-                # 手动核销入口，复用与扫码完全相同的后端核销逻辑。
-                gr.HTML(
-                    '<div class="backup-divider"></div>',
-                    padding=False,
-                    container=False,
-                )
-                gr.Markdown("#### 🔧 备用演示区")
-                with gr.Row(elem_classes="backup-row"):
+            # === 通道 2：人工取票码兜底 ===
+            with gr.Column(elem_classes="scan-panel manual-verify-panel"):
+                gr.Markdown("#### ⌨️ 通道二：人工输入取票码（兜底）")
+                with gr.Row(elem_classes="manual-verify-row"):
                     manual_code = gr.Textbox(
-                        label="模拟扫码（备用）—— 请输入电子票号或订单ID",
-                        placeholder="电子票号示例：TK-8；订单 ID 示例：8",
-                        scale=4,
-                        container=True,
+                        label="取票码", placeholder="请输入游客提供的取票码", scale=4,
                     )
                     manual_verify_button = gr.Button(
-                        "模拟扫码核销",
-                        variant="secondary",
-                        size="lg",
-                        scale=1,
-                        min_width=160,
+                        "确认核销", variant="primary", size="lg", scale=1, min_width=180,
                     )
-                gr.HTML(
-                    '<div class="backup-hint">'
-                    "注：备用区同样按【当前核销岗位】核销；"
-                    "真实场景下由摄像头自动识别，无需手动输入。"
-                    "</div>",
-                    padding=False,
-                    container=False,
-                )
-
+                manual_scan_status = gr.HTML(value=_SCAN_PLACEHOLDER)
         # -------------------------------------------------------------------
-        # Tab 3：运营后台（保留原有退款 / 分账演示能力）
+        # Tab 3：运营后台
         # -------------------------------------------------------------------
-        with gr.Tab("⚙️ 运营后台（演示）"):
+        with gr.Tab("⚙️ 运营后台"):
             with gr.Column(elem_classes="scan-panel"):
                 gr.Markdown(
                     "### 🧾 订单服务\n"
-                    "签名请求头（`X-Timestamp` / `X-Signature`）由前端自动生成；"
-                    "请确保前后端 `API_SIGNING_SECRET` 一致。\n\n"
-                    "分账仅结算“已核销”子项；只有生命周期结束后才能分账。"
-                    "离园后是否允许退款由园区配置决定；"
-                    "已分账订单不可再退款。"
+                    "按订单执行退款、分账或离园结算。\n\n"
+                    "· **申请退款**：仅退未核销项目，统一扣除 10% 手续费；\n\n"
+                    "· **执行分账**：仅结算已核销项目，生命周期结束后可用；\n\n"
+                    "· **一键离园结算**：登记离园，未使用项目立即过期，"
+                    "已核销金额分给商户，过期金额留在平台。\n\n"
+                    "已分账订单不可再退款或重复结算。"
                 )
                 order_id_input = gr.Number(
                     label="订单 ID（购票后自动填入，可手动修改）",
@@ -3218,10 +3314,17 @@ with gr.Blocks(title="乡村文旅电子门票") as demo:
                         variant="secondary",
                         size="lg",
                     )
+                    exit_settlement_button = gr.Button(
+                        "🚪 一键离园结算",
+                        variant="primary",
+                        size="lg",
+                    )
                 gr.Markdown(
                     "### 🏞️ 游园生命周期与退款规则\n"
                     "分账只在生命周期结束后执行；离园或闭园后，"
-                    "未核销项目是否还能退款由下面的园区配置决定。"
+                    "未核销项目是否还能退款由下面的园区配置决定。\n\n"
+                    "关闭“离园后仍允许退款”时，退款窗口输入框会自动隐藏，"
+                    "后端也会以“不允许退款”为最高优先级。"
                 )
                 with gr.Row():
                     refund_after_lifecycle = gr.Checkbox(
@@ -3253,21 +3356,87 @@ with gr.Blocks(title="乡村文旅电子门票") as demo:
                     sanitize_html=False,
                 )
 
-    reset_button.click(
-        reset_demo_environment,
-        inputs=None,
-        outputs=[
-            reset_result,
-            qr_image,
-            purchase_success,
-            qr_note,
-            order_id_input,
-            last_order,
-            order_status,
-            action_result,
-        ],
-        api_name="reset_demo",
-    )
+    # buy_button.click(
+    #     purchase,
+    #     inputs=None,
+    #     outputs=[
+    #         qr_image,
+    #         purchase_success,
+    #         qr_note,
+    #         order_id_input,
+    #         last_order,
+    #         order_status,
+    #     ],
+    #     api_name="purchase",
+    # )
+    # refresh_button.click(
+    #     _render_order_status,
+    #     inputs=[last_order],
+    #     outputs=order_status,
+    #     show_progress="hidden",
+    # )
+    # status_timer.tick(
+    #     _render_order_status,
+    #     inputs=[last_order],
+    #     outputs=order_status,
+    #     show_progress="hidden",
+    # )
+    # refund_button.click(
+    #     request_refund,
+    #     inputs=[last_order, order_id_input],
+    #     outputs=action_result,
+    #     api_name="request_refund",
+    # )
+    # split_button.click(
+    #     request_split,
+    #     inputs=[last_order, order_id_input],
+    #     outputs=action_result,
+    #     api_name="request_split",
+    # )
+    # exit_settlement_button.click(
+    #     request_exit_settlement,
+    #     inputs=[last_order, order_id_input],
+    #     outputs=action_result,
+    #     api_name="request_exit_settlement",
+    # )
+    # settings_button.click(
+    #     save_park_settings,
+    #     inputs=[refund_after_lifecycle, refund_window_hours],
+    #     outputs=settings_result,
+    #     api_name="save_park_settings",
+    # )
+    # # 关闭“离园后仍允许退款”时，立即隐藏退款窗口输入框，
+    # # 避免页面同时展示互相矛盾的配置。
+    # refund_after_lifecycle.change(
+    #     toggle_refund_window,
+    #     inputs=refund_after_lifecycle,
+    #     outputs=refund_window_hours,
+    #     show_progress="hidden",
+    # )
+    # demo.load(
+    #     load_park_settings,
+    #     inputs=None,
+    #     outputs=[refund_after_lifecycle, refund_window_hours, settings_result],
+    # )
+    # manual_verify_button.click(
+    #     manual_verify_by_pickup_code,
+    #     inputs=[manual_code],
+    #     outputs=[scan_status, verify_feedback],
+    #     api_name="manual_verify",
+    # )
+    # # 现场可直接按回车确认，减少检票员操作步骤。
+    # manual_code.submit(
+    #     manual_verify_by_pickup_code,
+    #     inputs=[manual_code],
+    #     outputs=[scan_status, verify_feedback],
+    #     show_progress="hidden",
+    # )
+
+
+    # ===========================================================================
+    # 事件绑定区
+    # ===========================================================================
+
     buy_button.click(
         purchase,
         inputs=None,
@@ -3279,69 +3448,82 @@ with gr.Blocks(title="乡村文旅电子门票") as demo:
             last_order,
             order_status,
         ],
+        # 保留 api_name，方便你在后台写脚本批量购票；如果不需要也可删除
         api_name="purchase",
     )
+    
     refresh_button.click(
         _render_order_status,
         inputs=[last_order],
         outputs=order_status,
         show_progress="hidden",
     )
+    
     status_timer.tick(
         _render_order_status,
         inputs=[last_order],
         outputs=order_status,
         show_progress="hidden",
     )
+    
+    # ⚠️ 修复点 1：删除了 api_name，避免 Gradio 将其视为标准 REST API 导致参数丢失
     refund_button.click(
         request_refund,
         inputs=[last_order, order_id_input],
         outputs=action_result,
-        api_name="request_refund",
     )
+    
+    # ⚠️ 修复点 2：删除了 api_name
     split_button.click(
         request_split,
         inputs=[last_order, order_id_input],
         outputs=action_result,
-        api_name="request_split",
     )
+    
+    # ⚠️ 修复点 3：删除了 api_name
+    exit_settlement_button.click(
+        request_exit_settlement,
+        inputs=[last_order, order_id_input],
+        outputs=action_result,
+    )
+    
     settings_button.click(
         save_park_settings,
         inputs=[refund_after_lifecycle, refund_window_hours],
         outputs=settings_result,
-        api_name="save_park_settings",
+        api_name="save_park_settings", # 这个你也可以视情况删除
     )
+    
+    # 关闭“离园后仍允许退款”时，立即隐藏退款窗口输入框
+    refund_after_lifecycle.change(
+        toggle_refund_window,
+        inputs=refund_after_lifecycle,
+        outputs=refund_window_hours,
+        show_progress="hidden",
+    )
+    
     demo.load(
         load_park_settings,
         inputs=None,
         outputs=[refund_after_lifecycle, refund_window_hours, settings_result],
     )
-    # 摄像头持续推流：服务端每 0.6 秒解析一帧，识别到二维码立即核销。
-    # 同一会话的流事件串行执行，避免现场重复提交。
-    camera.stream(
-        scan_and_verify,
-        inputs=[camera, verify_post, scan_state],
-        outputs=[scan_status, verify_feedback, scan_state],
-        stream_every=0.6,
-        show_progress="hidden",
-        concurrency_limit=1,
-        trigger_mode="always_last",
-        api_name="scan_and_verify",
-    )
+    
+    # ⚠️ 修复点 4：删除了 api_name
     manual_verify_button.click(
-        simulate_verify,
-        inputs=[manual_code, verify_post],
+        manual_verify_by_pickup_code,
+        # inputs=[manual_code],
+        inputs=[manual_code, post_selector], # <--- 加在这里
         outputs=[scan_status, verify_feedback],
-        api_name="simulate_verify",
     )
-    # 演示时也可以直接按回车触发，减少现场操作步骤。
+    
+    # 现场可直接按回车确认，减少检票员操作步骤。
     manual_code.submit(
-        simulate_verify,
-        inputs=[manual_code, verify_post],
+        manual_verify_by_pickup_code,
+        # inputs=[manual_code],
+        inputs=[manual_code, post_selector], # <--- 加在这里
         outputs=[scan_status, verify_feedback],
         show_progress="hidden",
     )
-
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=4).launch(

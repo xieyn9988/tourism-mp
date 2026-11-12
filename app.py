@@ -1,12 +1,12 @@
 """
-乡村文旅多商户运营中台 POC —— Gradio 演示面板
+乡村文旅多商户运营中台 —— Gradio 运营面板
 ================================================
 
 功能：
-    1. 一键重置演示环境：清空历史订单 / 核销记录，并生成一张全新测试订单；
-    2. 游客端退款：输入订单 ID，展示逐项退款明细（已用退款 0 / 未用扣 10%）；
-    3. 核销控制台：输入 verify_records.id，调用 FastAPI 核销接口；
-    4. 后台数据监控：读取核销记录，展示 ID、订单号、核销状态。
+    1. 游客退款：输入订单 ID，展示逐项退款明细（已用退款 0 / 未用扣 10%）；
+    2. 人工核销通道：输入游客提供的取票码（真实订单 ID），
+       按门票 → 咖啡 → 越野车的顺序核销下一个未使用项目；
+    3. 核销记录：读取核销记录，展示 ID、订单号、核销状态。
 
 依赖安装：
     pip install "gradio>=6" requests
@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import html
 import os
+import re
 import time
 from typing import Any
 
@@ -37,7 +38,7 @@ import requests
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 REQUEST_TIMEOUT = 5  # 秒
 
-# 必须与 main.py 的 API_SIGNING_SECRET 保持一致，否则退款 / 重置接口返回 403。
+# 必须与 main.py 的 API_SIGNING_SECRET 保持一致，否则退款接口返回 403。
 DEFAULT_SIGNING_SECRET = "tourism-mp-demo-secret"
 SIGNING_SECRET = os.getenv("API_SIGNING_SECRET", DEFAULT_SIGNING_SECRET)
 
@@ -45,6 +46,7 @@ STATUS_LABELS = {
     "unverified": "未核销",
     "verified": "已核销",
     "refunded": "已退款",
+    "expired": "已过期",
 }
 
 CSS = """
@@ -70,13 +72,6 @@ CSS = """
 .poc-card h2 {
     font-size: 1.15rem;
     margin-bottom: 0.75rem;
-}
-.poc-reset-card {
-    border-color: #fde68a;
-    background: #fffbeb;
-}
-.poc-reset-card h2 {
-    color: #92400e;
 }
 .poc-alert {
     display: flex;
@@ -264,16 +259,7 @@ def _alert(kind: str, title: str, message: str) -> str:
 def _placeholder_alert() -> str:
     return (
         '<div class="poc-alert poc-alert-ready poc-alert-placeholder" role="status">'
-        "<div><span>输入核销记录 ID，点击按钮完成核销。</span></div>"
-        "</div>"
-    )
-
-
-def _reset_placeholder_alert() -> str:
-    return (
-        '<div class="poc-alert poc-alert-ready poc-alert-placeholder" role="status">'
-        "<div><span>点击「🔄 重置演示环境」，清空历史数据并生成一张全新的"
-        "“已支付、三项未核销”测试订单。</span></div>"
+        "<div><span>输入游客提供的取票码，点击按钮完成人工核销。</span></div>"
         "</div>"
     )
 
@@ -415,93 +401,6 @@ def request_refund(order_id: float | int | None) -> str:
     )
 
 
-# ===========================================================================
-# 一键重置演示环境
-# ===========================================================================
-
-def reset_demo() -> tuple[str, Any, Any, str, str, list[list[Any]]]:
-    """
-    调用 POST /api/demo/reset：
-      - 清空历史订单 / 核销记录 / 分账流水；
-      - 生成一张 paid + 三项 unverified 的新订单；
-      - 自动把新订单 ID 填进退款输入框。
-    """
-    try:
-        response = _request("POST", "/api/demo/reset", signed=True)
-    except BackendError as exc:
-        return (
-            _alert("error", "重置失败", str(exc)),
-            gr.update(),
-            gr.update(),
-            _alert("error", "数据刷新失败", str(exc)),
-            "",
-            _safe_rows(),
-        )
-
-    if response.status_code != 200:
-        detail = _error_detail(response)
-        if response.status_code == 403:
-            detail = (
-                "签名验证失败：请确认前后端 API_SIGNING_SECRET 一致，"
-                "并检查本机时间是否准确。"
-            )
-        return (
-            _alert("error", f"重置失败（HTTP {response.status_code}）", detail),
-            gr.update(),
-            gr.update(),
-            _alert("error", "数据刷新失败", detail),
-            "",
-            _safe_rows(),
-        )
-
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    if not isinstance(data, dict) or "order_id" not in data:
-        return (
-            _alert("error", "重置失败", "后端返回的数据格式不正确。"),
-            gr.update(),
-            gr.update(),
-            _alert("error", "数据刷新失败", "后端返回的数据格式不正确。"),
-            "",
-            _safe_rows(),
-        )
-
-    order_id = data.get("order_id")
-    order_no = data.get("order_no")
-    ticket_record_id = data.get("ticket_record_id")
-    # 注意：Gradio 的成功提示会 print 到控制台，Windows GBK 终端无法编码
-    # emoji，因此 toast 使用纯文本；绿色 ✅ 卡片由 HTML 内联提示展示。
-    message = f"演示环境已重置，请使用新订单 ID：{order_id} 开始测试！"
-
-    gr.Success(message, title="演示环境已重置")
-
-    rows, note = _refresh_after_action()
-    table_note = f"当前共 {len(rows)} 条核销记录。"
-    if note:
-        table_note += f"（表格刷新失败：{note}）"
-
-    return (
-        _alert(
-            "success",
-            "演示环境已重置",
-            f"新订单 ID：{order_id}；订单号：{order_no}；"
-            "门票、咖啡、越野车三项均为未核销。",
-        ),
-        gr.update(value=ticket_record_id),
-        gr.update(value=order_id),
-        (
-            f"### ✅ 新订单已就绪\n"
-            f"已自动切换到订单 `#{order_id}`（{order_no}）。\n\n"
-            "可以直接点击下方「💸 申请退款」查看退款明细，"
-            "或先核销部分项目后再退款，验证“部分退款”逻辑。"
-        ),
-        _alert("ready", "后台数据已刷新", table_note),
-        rows,
-    )
-
-
 def load_dashboard() -> tuple[str, list[list[Any]]]:
     """页面加载时读取一次后台数据。"""
     try:
@@ -516,32 +415,108 @@ def refresh_table() -> tuple[str, list[list[Any]]]:
     return load_dashboard()
 
 
-def verify_record(record_id: float | int | None) -> tuple[str, list[list[Any]]]:
+def verify_by_pickup_code(
+    pickup_code: float | int | str | None,
+) -> tuple[str, list[list[Any]]]:
     """
-    调用 POST /api/verify-records/{record_id}/verify。
+    人工核销通道：取票码（真实订单 ID）→ 核销下一个未使用项目。
 
-    无论成功与否，都会尝试刷新右侧监控表格，方便直接观察状态变化。
+    检票员扫码失败时，只需输入游客购票成功后看到的取票码：
+      1. 读取订单及其全部核销子项；
+      2. 按门票 → 咖啡 → 越野车的顺序选择下一个 unverified 子项；
+      3. 调用核销接口；后端仍会执行闭园、生命周期、退款 / 过期校验。
+
+    无论成功与否都会刷新核销记录表格。
     """
-    if record_id is None:
-        return _alert("error", "参数错误", "请输入核销记录 ID。"), _safe_rows()
+    if pickup_code in (None, ""):
+        return _alert("error", "参数错误", "请输入游客提供的取票码。"), _safe_rows()
+
+    text = str(pickup_code).strip()
+    if not re.fullmatch(r"\d{1,9}", text):
+        return (
+            _alert("error", "参数错误", "取票码格式不正确，请输入订单编号。"),
+            _safe_rows(),
+        )
+    order_id = int(text)
+    if order_id <= 0:
+        return (
+            _alert("error", "参数错误", "取票码必须是正整数。"),
+            _safe_rows(),
+        )
 
     try:
-        rid = int(record_id)
+        order_response = _request("GET", f"/api/orders/{order_id}")
+    except BackendError as exc:
+        return _alert("error", "核销失败", str(exc)), _safe_rows()
+
+    if order_response.status_code == 404:
+        return (
+            _alert("error", "未找到该取票码", "请核对游客提供的取票码。"),
+            _safe_rows(),
+        )
+    if order_response.status_code != 200:
+        return (
+            _alert(
+                "error",
+                f"读取订单失败（HTTP {order_response.status_code}）",
+                _error_detail(order_response),
+            ),
+            _safe_rows(),
+        )
+
+    try:
+        order = order_response.json()
+    except ValueError:
+        order = None
+    if not isinstance(order, dict):
+        return _alert("error", "订单数据异常", "后端返回内容无法解析。"), _safe_rows()
+
+    records = [
+        item
+        for item in (order.get("verify_records") or [])
+        if isinstance(item, dict)
+    ]
+    pending = [
+        item
+        for item in records
+        if str(item.get("verify_status") or "") == "unverified"
+    ]
+    if not pending:
+        statuses = {str(item.get("verify_status") or "") for item in records}
+        if "expired" in statuses:
+            message = "本次游园已结束，未使用项目已过期；如需游玩请重新购票。"
+        elif "verified" in statuses:
+            message = "该订单所有项目均已核销，无需重复操作。"
+        else:
+            message = "该订单暂无可核销项目。"
+        return _alert("ready", "无需核销", message), _safe_rows()
+
+    # 按业务顺序选择：门票最先，其次咖啡，最后越野车。
+    target = None
+    for keyword in ("门票", "咖啡", "越野车"):
+        target = next(
+            (
+                item
+                for item in pending
+                if keyword in str(item.get("item_name") or "")
+            ),
+            None,
+        )
+        if target is not None:
+            break
+    if target is None:
+        target = pending[0]
+
+    try:
+        record_id = int(target.get("id"))
     except (TypeError, ValueError):
         return (
-            _alert("error", "参数错误", "核销记录 ID 必须是正整数。"),
+            _alert("error", "订单数据异常", "核销子项缺少有效编号。"),
             _safe_rows(),
         )
 
-    if rid <= 0:
-        return (
-            _alert("error", "参数错误", "核销记录 ID 必须是正整数。"),
-            _safe_rows(),
-        )
-
-    response = None
     try:
-        response = _request("POST", f"/api/verify-records/{rid}/verify")
+        response = _request("POST", f"/api/verify-records/{record_id}/verify")
     except BackendError as exc:
         return _alert("error", "核销失败", str(exc)), _safe_rows()
 
@@ -550,9 +525,12 @@ def verify_record(record_id: float | int | None) -> tuple[str, list[list[Any]]]:
             record = response.json()
         except ValueError:
             record = {}
-        item_name = record.get("item_name") if isinstance(record, dict) else None
-        item_text = f"「{item_name}」" if item_name else ""
-        message = f"记录 #{rid}{item_text} 已核销成功。"
+        item_name = (
+            record.get("item_name") if isinstance(record, dict) else None
+        ) or target.get("item_name")
+        message = (
+            f"取票码 {order_id} 的「{item_name}」已核销成功。"
+        )
         gr.Success(message, title="核销成功")
         rows, note = _refresh_after_action()
         if note:
@@ -561,7 +539,7 @@ def verify_record(record_id: float | int | None) -> tuple[str, list[list[Any]]]:
 
     detail = _error_detail(response)
     if response.status_code == 409:
-        detail = f"请勿重复核销：{detail}"
+        detail = f"当前订单不可核销：{detail}"
     elif response.status_code == 404:
         detail = f"核销记录不存在：{detail}"
     elif response.status_code == 400:
@@ -586,32 +564,13 @@ def _refresh_after_action() -> tuple[list[list[Any]], str | None]:
         return [], str(exc)
 
 
-with gr.Blocks(title="乡村文旅多商户运营中台 POC") as demo:
+with gr.Blocks(title="乡村文旅多商户运营中台") as demo:
     with gr.Column(elem_classes="app-shell"):
         gr.Markdown(
-            "# 乡村文旅多商户运营中台 POC\n"
-            "FastAPI 核销接口联调面板 · 多商户订单履约演示",
+            "# 乡村文旅多商户运营中台\n"
+            "订单履约 · 人工核销 · 分账对账",
             elem_classes="poc-title",
         )
-
-        # -------------------------------------------------------------------
-        # 最显眼位置：一键重置演示环境
-        # -------------------------------------------------------------------
-        with gr.Group(elem_classes="poc-card poc-reset-card"):
-            with gr.Row():
-                with gr.Column(scale=4):
-                    gr.Markdown(
-                        "## 🔄 演示环境\n"
-                        "一键清空历史订单 / 核销记录 / 分账流水，并自动生成一张"
-                        "**已支付、门票+咖啡+越野车均未核销**的新订单。"
-                    )
-                reset_button = gr.Button(
-                    "🔄 重置演示环境",
-                    variant="stop",
-                    size="lg",
-                    scale=1,
-                )
-            reset_alert = gr.HTML(value=_reset_placeholder_alert())
 
         # -------------------------------------------------------------------
         # 游客端：申请退款 + 逐项明细
@@ -624,11 +583,11 @@ with gr.Blocks(title="乡村文旅多商户运营中台 POC") as demo:
             )
             with gr.Row():
                 refund_order_id = gr.Number(
-                    value=1,
+                    value=None,
                     precision=0,
                     minimum=1,
                     step=1,
-                    label="订单 ID（重置后自动填入）",
+                    label="订单 ID",
                     scale=1,
                 )
                 refund_button = gr.Button(
@@ -646,21 +605,22 @@ with gr.Blocks(title="乡村文旅多商户运营中台 POC") as demo:
             )
 
         # -------------------------------------------------------------------
-        # 核销控制台
+        # 商家核销端：人工核销通道
         # -------------------------------------------------------------------
         with gr.Group(elem_classes="poc-card"):
-            gr.Markdown("## 核销控制台")
+            gr.Markdown(
+                "## 商家核销端 · 人工核销通道\n"
+                "扫码失败时，请输入游客提供的取票码，点击「确认核销」完成补录。"
+            )
             with gr.Row():
-                record_id = gr.Number(
-                    value=1,
-                    precision=0,
-                    minimum=1,
-                    step=1,
-                    label="核销记录 ID（record_id）",
+                pickup_code = gr.Textbox(
+                    value="",
+                    label="取票码",
+                    placeholder="请输入游客提供的取票码",
                     scale=1,
                 )
                 verify_button = gr.Button(
-                    "点击扫码核销",
+                    "确认核销",
                     variant="primary",
                     scale=1,
                 )
@@ -668,7 +628,7 @@ with gr.Blocks(title="乡村文旅多商户运营中台 POC") as demo:
 
         with gr.Group(elem_classes="poc-card"):
             with gr.Row():
-                gr.Markdown("## 后台数据监控")
+                gr.Markdown("## 核销记录")
                 refresh_button = gr.Button("刷新数据", size="sm", scale=0)
             table = gr.Dataframe(
                 headers=["ID", "订单号", "状态"],
@@ -680,26 +640,19 @@ with gr.Blocks(title="乡村文旅多商户运营中台 POC") as demo:
             )
 
     demo.load(load_dashboard, inputs=None, outputs=[result, table])
-    reset_button.click(
-        reset_demo,
-        inputs=None,
-        outputs=[
-            reset_alert,
-            record_id,
-            refund_order_id,
-            refund_result,
-            result,
-            table,
-        ],
-    )
     refund_button.click(
         request_refund,
         inputs=refund_order_id,
         outputs=refund_result,
     )
     verify_button.click(
-        verify_record,
-        inputs=record_id,
+        verify_by_pickup_code,
+        inputs=pickup_code,
+        outputs=[result, table],
+    )
+    pickup_code.submit(
+        verify_by_pickup_code,
+        inputs=pickup_code,
         outputs=[result, table],
     )
     refresh_button.click(
